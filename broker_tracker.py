@@ -10,7 +10,6 @@ import json
 import logging
 from datetime import datetime
 from typing import Dict, List, Set, Tuple
-import openpyxl
 from openpyxl.utils import get_column_letter
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
