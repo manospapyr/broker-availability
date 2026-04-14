@@ -216,7 +216,7 @@ class BrokerTracker:
         data.append(['Station', 'Service', 'Available Brokers', 'Count'])
         
         # Get all unique stations
-        all_stations = set(self.otaq_data.values().__iter__() if self.otaq_data else [])
+        all_stations = set()
         for stations_dict in self.otaq_data.values():
             all_stations.update(stations_dict.keys())
         for stations_dict in self.drive365_data.values():
