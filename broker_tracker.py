@@ -1,373 +1,363 @@
 #!/usr/bin/env python3
 """
 Broker Availability Tracker
-Automatically tracks where otoQ and Drive365 are LIVE vs NOT LIVE
-Updates Google Sheets daily with change detection
+Checks car rental broker websites for availability of otoQ and Drive365
+across their respective operating areas, and outputs results to an Excel file.
 """
 
-import os
-import json
-import logging
-from datetime import datetime
-from typing import Dict, List, Set, Tuple
-from openpyxl.utils import get_column_letter
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from io import BytesIO
 import requests
+import time
+import re
+import json
+import os
+from datetime import datetime, timedelta
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# ──────────────────────────────────────────────────────────────────────
+# CONFIGURATION: Brands, areas, brokers
+# ──────────────────────────────────────────────────────────────────────
+
+OTOQ_AREAS = {
+    "Greece": ["Athens", "Zante", "Chania", "Heraklion"],
+    "Malta": ["Valletta"],
+    "Albania": ["Tirana"],
+    "Tunisia": ["Tunis", "Enfidha", "Monastir", "Djerba"],
+    "United States": ["Orlando", "Miami", "Tampa", "Hollywood"],
+    "Morocco": ["Rabat", "Fez", "Tangier", "Agadir", "Marrakesh", "Casablanca"],
+    "Montenegro": ["Podgorica"],
+    "Romania": ["Timisoara"],
+    "Mauritius": ["Plaisance"],
+}
+
+DRIVE365_AREAS = {
+    "Greece": ["Heraklion", "Athens"],
+    "Albania": ["Tirana"],
+    "United States": ["Miami", "Tampa", "Hollywood", "Orlando"],
+    "Malta": ["Valletta"],
+    "Montenegro": ["Podgorica", "Tivat"],
+}
+
+OTOQ_BROKERS = [
+    "Discovercars.com",
+    "Qeeq.com",
+    "Orbitcarhire.com",
+    "carrental.hotelbeds.com",
+    "Enjoytravel.com",
+    "Aurumcars.de",
+    "Carjet.com",
+    "Rentcars.com/en",
+    "CarFlexi.com",
+    "Economybookings.com",
+    "Priceline.com/rental-cars",
+    "Rentcarla.com",
+    "Vipcars.com",
+    "Yolcu360",
+    "Wisecars.com",
+    "BSP-auto.com",
+    "StressFreeCarRental.com",
+    "otoQ.rent",
+]
+
+DRIVE365_BROKERS = [
+    "Discovercars.com",
+    "Orbitcarhire.com",
+    "Vipcars.com",
+    "Enjoytravel.com",
+    "Carjet.com",
+    "EconomyBookings.com",
+    "bsp-auto.com",
+    "Aurum",
+    "StressFreeCarRental.com",
+    "Drive365.rent",
+]
+
+# ──────────────────────────────────────────────────────────────────────
+# SEARCH FUNCTIONS
+# ──────────────────────────────────────────────────────────────────────
+
+# Location name mappings for search queries
+LOCATION_SEARCH_NAMES = {
+    "Athens": "Athens Airport",
+    "Zante": "Zakynthos Airport",
+    "Chania": "Chania Airport",
+    "Heraklion": "Heraklion Airport",
+    "Valletta": "Malta Airport",
+    "Tirana": "Tirana Airport",
+    "Tunis": "Tunis Airport",
+    "Enfidha": "Enfidha Airport",
+    "Monastir": "Monastir Airport",
+    "Djerba": "Djerba Airport",
+    "Orlando": "Orlando Airport",
+    "Miami": "Miami Airport",
+    "Tampa": "Tampa Airport",
+    "Hollywood": "Fort Lauderdale Airport",
+    "Rabat": "Rabat Airport",
+    "Fez": "Fez Airport",
+    "Tangier": "Tangier Airport",
+    "Agadir": "Agadir Airport",
+    "Marrakesh": "Marrakech Airport",
+    "Casablanca": "Casablanca Airport",
+    "Podgorica": "Podgorica Airport",
+    "Timisoara": "Timisoara Airport",
+    "Plaisance": "Mauritius Airport",
+    "Tivat": "Tivat Airport",
+}
+
+# Brand name as it appears on broker sites
+BRAND_SEARCH_NAMES = {
+    "otoQ": ["otoQ", "otoq", "OTOQ", "Oto Q"],
+    "Drive365": ["Drive365", "drive365", "DRIVE365", "Drive 365"],
+}
 
 
-class BrokerTracker:
-    """Track broker availability with change detection"""
+def check_broker_availability(broker, brand, location):
+    """
+    Check if a broker lists a brand at a given location.
     
-    def __init__(self, google_creds: str, spreadsheet_id: str):
-        self.spreadsheet_id = spreadsheet_id
-        self.sheet_service = self._init_sheets_service(google_creds)
-        
-        # Data structures
-        self.otaq_data = {}  # {broker: {station: availability}}
-        self.drive365_data = {}
-        self.previous_state = {}
-        self.changes = {'new': [], 'lost': []}
+    Returns:
+        "✔" if available
+        "✖" if checked and not available
+        "N/A" if the check could not be completed (error, timeout, etc.)
+    """
+    search_location = LOCATION_SEARCH_NAMES.get(location, location)
+    brand_names = BRAND_SEARCH_NAMES.get(brand, [brand])
     
-    def _init_sheets_service(self, creds_json: str):
-        """Initialize Google Sheets API"""
-        creds_dict = json.loads(creds_json)
-        credentials = service_account.Credentials.from_service_account_info(
-            creds_dict,
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-        return build('sheets', 'v4', credentials=credentials)
+    # Build the search URL based on the broker
+    broker_lower = broker.lower().replace(" ", "")
     
-    def parse_broker_data(self, excel_file_path: str = None):
-        """Parse broker data from Excel file or create mock data"""
+    try:
+        # Use a pickup date 30 days from now, return 37 days from now
+        pickup = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        dropoff = (datetime.now() + timedelta(days=37)).strftime("%Y-%m-%d")
         
-        # Mock data based on the actual structure
-        otaq_stations = [
-            'Athens', 'Zante', 'Chania', 'Heraklion', 'Valletta',
-            'Tirana', 'Tunis', 'Enfidha', 'Monastir', 'Djerba',
-            'Orlando', 'Miami', 'Tampa', 'Hollywood', 'Rabat',
-            'Fez', 'Tangier', 'Agadir', 'Marrakesh', 'Casablanca',
-            'Podgorica', 'Timisoara', 'Plaisance'
-        ]
+        # Different URL patterns per broker
+        url = build_broker_url(broker, search_location, pickup, dropoff)
         
-        drive365_stations = [
-            'Heraklion', 'Athens', 'Tirana', 'Miami', 'Tampa',
-            'Hollywood', 'Orlando', 'Valletta', 'Podgorica', 'Tivat'
-        ]
+        if url is None:
+            return "N/A"
         
-        otaq_data = {
-            'Discovercars.com': {'Athens': True, 'Zante': True, 'Chania': True, 'Heraklion': True, 'Valletta': False, 'Tirana': True, 'Tunis': True, 'Enfidha': False, 'Monastir': True, 'Djerba': True, 'Orlando': True, 'Miami': True, 'Tampa': True, 'Hollywood': True, 'Rabat': True, 'Fez': True, 'Tangier': True, 'Agadir': True, 'Marrakesh': False, 'Casablanca': True, 'Podgorica': True, 'Timisoara': True, 'Plaisance': True},
-            'Qeeq.com': {'Athens': True, 'Zante': True, 'Chania': True, 'Heraklion': True, 'Valletta': False, 'Tirana': True, 'Tunis': True, 'Enfidha': True, 'Monastir': True, 'Djerba': True, 'Orlando': False, 'Miami': True, 'Tampa': True, 'Hollywood': True, 'Rabat': True, 'Fez': True, 'Tangier': True, 'Agadir': True, 'Marrakesh': True, 'Casablanca': True, 'Podgorica': True, 'Timisoara': False, 'Plaisance': False},
-            'Orbitcarhire.com': {'Athens': True, 'Zante': True, 'Chania': True, 'Heraklion': False, 'Valletta': False, 'Tirana': True, 'Tunis': True, 'Enfidha': True, 'Monastir': True, 'Djerba': True, 'Orlando': False, 'Miami': False, 'Tampa': False, 'Hollywood': False, 'Rabat': True, 'Fez': True, 'Tangier': True, 'Agadir': True, 'Marrakesh': True, 'Casablanca': True, 'Podgorica': False, 'Timisoara': True, 'Plaisance': True},
-            'Carjet.com': {'Athens': True, 'Zante': True, 'Chania': True, 'Heraklion': True, 'Valletta': True, 'Tirana': True, 'Tunis': True, 'Enfidha': True, 'Monastir': True, 'Djerba': True, 'Orlando': True, 'Miami': True, 'Tampa': False, 'Hollywood': True, 'Rabat': True, 'Fez': True, 'Tangier': True, 'Agadir': True, 'Marrakesh': True, 'Casablanca': True, 'Podgorica': False, 'Timisoara': False, 'Plaisance': False},
-            'Vipcars.com': {'Athens': True, 'Zante': True, 'Chania': True, 'Heraklion': True, 'Valletta': True, 'Tirana': True, 'Tunis': True, 'Enfidha': True, 'Monastir': True, 'Djerba': True, 'Orlando': False, 'Miami': False, 'Tampa': False, 'Hollywood': False, 'Rabat': True, 'Fez': True, 'Tangier': True, 'Agadir': True, 'Marrakesh': True, 'Casablanca': True, 'Podgorica': True, 'Timisoara': True, 'Plaisance': True},
-            'Economybookings.com': {'Athens': True, 'Zante': True, 'Chania': True, 'Heraklion': True, 'Valletta': True, 'Tirana': True, 'Tunis': True, 'Enfidha': True, 'Monastir': True, 'Djerba': False, 'Orlando': False, 'Miami': False, 'Tampa': False, 'Hollywood': False, 'Rabat': True, 'Fez': True, 'Tangier': True, 'Agadir': True, 'Marrakesh': True, 'Casablanca': True, 'Podgorica': True, 'Timisoara': True, 'Plaisance': True},
-            'Priceline.com': {'Athens': True, 'Zante': True, 'Chania': True, 'Heraklion': True, 'Valletta': True, 'Tirana': True, 'Tunis': True, 'Enfidha': True, 'Monastir': True, 'Djerba': True, 'Orlando': True, 'Miami': True, 'Tampa': True, 'Hollywood': True, 'Rabat': True, 'Fez': True, 'Tangier': True, 'Agadir': True, 'Marrakesh': True, 'Casablanca': True, 'Podgorica': True, 'Timisoara': True, 'Plaisance': True},
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
         }
         
-        drive365_data = {
-            'Discovercars.com': {'Heraklion': True, 'Athens': True, 'Tirana': True, 'Miami': True, 'Tampa': True, 'Hollywood': True, 'Orlando': True, 'Valletta': True, 'Podgorica': True, 'Tivat': True},
-            'Vipcars.com': {'Heraklion': True, 'Athens': True, 'Tirana': True, 'Miami': False, 'Tampa': False, 'Hollywood': False, 'Orlando': False, 'Valletta': True, 'Podgorica': True, 'Tivat': True},
-            'Carjet.com': {'Heraklion': True, 'Athens': True, 'Tirana': True, 'Miami': True, 'Tampa': True, 'Hollywood': True, 'Orlando': True, 'Valletta': False, 'Podgorica': True, 'Tivat': True},
-            'Orbitcarhire.com': {'Heraklion': True, 'Athens': True, 'Tirana': True, 'Miami': True, 'Tampa': False, 'Hollywood': True, 'Orlando': False, 'Valletta': True, 'Podgorica': True, 'Tivat': True},
-            'EconomyBookings.com': {'Heraklion': True, 'Athens': True, 'Tirana': True, 'Miami': True, 'Tampa': False, 'Hollywood': False, 'Orlando': False, 'Valletta': True, 'Podgorica': True, 'Tivat': True},
-            'StressFreeCarRental.com': {'Heraklion': True, 'Athens': True, 'Tirana': True, 'Miami': True, 'Tampa': True, 'Hollywood': True, 'Orlando': True, 'Valletta': True, 'Podgorica': True, 'Tivat': True},
-            'Drive365.rent': {'Heraklion': True, 'Athens': True, 'Tirana': True, 'Miami': True, 'Tampa': True, 'Hollywood': True, 'Orlando': True, 'Valletta': True, 'Podgorica': True, 'Tivat': True},
-        }
+        response = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
         
-        self.otaq_data = otaq_data
-        self.drive365_data = drive365_data
-        logger.info(f"✓ Loaded data: {len(otaq_data)} otoQ brokers, {len(drive365_data)} Drive365 brokers")
+        if response.status_code != 200:
+            return "N/A"
+        
+        page_content = response.text.lower()
+        
+        # Check if any brand name variant appears in the page
+        for name in brand_names:
+            if name.lower() in page_content:
+                return "✔"
+        
+        return "✖"
+        
+    except requests.exceptions.Timeout:
+        return "N/A"
+    except requests.exceptions.ConnectionError:
+        return "N/A"
+    except Exception as e:
+        print(f"  Error checking {broker} for {brand} at {location}: {e}")
+        return "N/A"
+
+
+def build_broker_url(broker, location, pickup, dropoff):
+    """Build the search URL for a specific broker."""
+    location_encoded = requests.utils.quote(location)
     
-    def load_previous_state(self):
-        """Load previous state from sheet for change detection"""
-        try:
-            result = self.sheet_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Raw Data!A:D'
-            ).execute()
+    broker_urls = {
+        "discovercars.com": f"https://www.discovercars.com/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "qeeq.com": f"https://www.qeeq.com/car-rental?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "orbitcarhire.com": f"https://www.orbitcarhire.com/search?location={location_encoded}&from={pickup}&to={dropoff}",
+        "carrental.hotelbeds.com": f"https://carrental.hotelbeds.com/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "enjoytravel.com": f"https://www.enjoytravel.com/en/car-rental?location={location_encoded}&from={pickup}&to={dropoff}",
+        "aurumcars.de": f"https://www.aurumcars.de/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "carjet.com": f"https://www.carjet.com/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "rentcars.com/en": f"https://www.rentcars.com/en/search?location={location_encoded}&from={pickup}&to={dropoff}",
+        "carflexi.com": f"https://www.carflexi.com/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "economybookings.com": f"https://www.economybookings.com/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "priceline.com/rental-cars": f"https://www.priceline.com/rental-cars/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "rentcarla.com": f"https://www.rentcarla.com/search?location={location_encoded}&from={pickup}&to={dropoff}",
+        "vipcars.com": f"https://www.vipcars.com/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "yolcu360": f"https://www.yolcu360.com/en/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "wisecars.com": f"https://www.wisecars.com/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "bsp-auto.com": f"https://www.bsp-auto.com/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+        "stressfreecarrental.com": f"https://www.stressfreecarrental.com/search?location={location_encoded}&from={pickup}&to={dropoff}",
+        "otoq.rent": f"https://otoq.rent",
+        "drive365.rent": f"https://drive365.rent",
+        "aurum": f"https://www.aurumcars.de/search?location={location_encoded}&pickup={pickup}&dropoff={dropoff}",
+    }
+    
+    key = broker.lower().replace(" ", "")
+    return broker_urls.get(key, None)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# EXCEL OUTPUT
+# ──────────────────────────────────────────────────────────────────────
+
+def write_excel(otoq_results, drive365_results, filename="Broker_Availability_Tracker.xlsx"):
+    """Write results to Excel matching the reference spreadsheet format."""
+    wb = Workbook()
+    
+    # --- Sheet 1: otoQ ---
+    ws1 = wb.active
+    ws1.title = "otoQ"
+    write_brand_sheet(ws1, "otoQ", OTOQ_AREAS, OTOQ_BROKERS, otoq_results)
+    
+    # --- Sheet 2: Drive365 ---
+    ws2 = wb.create_sheet("Drive365")
+    write_brand_sheet(ws2, "DRIVE365", DRIVE365_AREAS, DRIVE365_BROKERS, drive365_results)
+    
+    wb.save(filename)
+    print(f"Results saved to {filename}")
+
+
+def write_brand_sheet(ws, brand_label, areas, brokers, results):
+    """Write a single brand sheet in the reference format."""
+    
+    # Styles
+    header_font = Font(bold=True, size=11, name="Arial")
+    brand_font = Font(bold=True, size=14, name="Arial")
+    country_font = Font(bold=True, size=11, name="Arial")
+    city_font = Font(italic=True, size=10, name="Arial")
+    cell_font = Font(size=10, name="Arial")
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+    
+    green_fill = PatternFill("solid", fgColor="C6EFCE")
+    red_fill = PatternFill("solid", fgColor="FFC7CE")
+    grey_fill = PatternFill("solid", fgColor="D9D9D9")
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    header_font_white = Font(bold=True, size=11, name="Arial", color="FFFFFF")
+    
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+    
+    # Build flat list of cities with their countries
+    cities = []
+    country_spans = []  # (country_name, start_col, end_col)
+    col = 2  # Column B onwards (A is for broker names)
+    for country, city_list in areas.items():
+        start = col
+        for city in city_list:
+            cities.append((country, city))
+            col += 1
+        country_spans.append((country, start, col - 1))
+    
+    total_cols = col - 1
+    
+    # Row 1: Brand name
+    ws.cell(row=1, column=1, value=brand_label).font = brand_font
+    
+    # Row 2: Country header row
+    for country, start, end in country_spans:
+        cell = ws.cell(row=2, column=start, value=country)
+        cell.font = header_font_white
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = thin_border
+        if start != end:
+            ws.merge_cells(start_row=2, start_column=start, end_row=2, end_column=end)
+        # Fill merged cells border
+        for c in range(start, end + 1):
+            ws.cell(row=2, column=c).border = thin_border
+            ws.cell(row=2, column=c).fill = header_fill
+    
+    # Row 3: City header row
+    for idx, (country, city) in enumerate(cities):
+        c = idx + 2
+        cell = ws.cell(row=3, column=c, value=city)
+        cell.font = city_font
+        cell.alignment = center
+        cell.border = thin_border
+    
+    # Header for broker column
+    ws.cell(row=2, column=1, value="").border = thin_border
+    ws.cell(row=3, column=1, value="").border = thin_border
+    
+    # Data rows (brokers)
+    for b_idx, broker in enumerate(brokers):
+        row = 4 + b_idx
+        cell = ws.cell(row=row, column=1, value=broker)
+        cell.font = cell_font
+        cell.alignment = left
+        cell.border = thin_border
+        
+        for c_idx, (country, city) in enumerate(cities):
+            col_num = c_idx + 2
+            value = results.get(broker, {}).get(city, "N/A")
+            cell = ws.cell(row=row, column=col_num, value=value)
+            cell.font = cell_font
+            cell.alignment = center
+            cell.border = thin_border
             
-            values = result.get('values', [])
-            for row in values[1:]:  # Skip header
-                if len(row) >= 4:
-                    broker, station, service, status = row[0], row[1], row[2], row[3]
-                    key = f"{broker}#{station}#{service}"
-                    self.previous_state[key] = status == '✅ LIVE'
-            
-            logger.info(f"✓ Loaded {len(self.previous_state)} previous state records")
-        except:
-            logger.info("First run - no previous state available")
+            if value == "✔":
+                cell.fill = green_fill
+            elif value == "✖":
+                cell.fill = red_fill
+            else:  # N/A
+                cell.fill = grey_fill
     
-    def detect_changes(self):
-        """Detect NEW and LOST broker locations"""
-        current_keys = set()
-        
-        # Track otoQ changes
-        for broker, stations in self.otaq_data.items():
-            for station, is_live in stations.items():
-                key = f"{broker}#{station}#otoQ"
-                current_keys.add(key)
-                
-                is_new = key not in self.previous_state
-                was_live = self.previous_state.get(key, False)
-                
-                if is_live and (is_new or not was_live):
-                    self.changes['new'].append({
-                        'type': '✅ NEW',
-                        'broker': broker,
-                        'station': station,
-                        'service': 'otoQ'
-                    })
-                elif not is_live and was_live:
-                    self.changes['lost'].append({
-                        'type': '❌ LOST',
-                        'broker': broker,
-                        'station': station,
-                        'service': 'otoQ'
-                    })
-        
-        # Track Drive365 changes
-        for broker, stations in self.drive365_data.items():
-            for station, is_live in stations.items():
-                key = f"{broker}#{station}#Drive365"
-                current_keys.add(key)
-                
-                is_new = key not in self.previous_state
-                was_live = self.previous_state.get(key, False)
-                
-                if is_live and (is_new or not was_live):
-                    self.changes['new'].append({
-                        'type': '✅ NEW',
-                        'broker': broker,
-                        'station': station,
-                        'service': 'Drive365'
-                    })
-                elif not is_live and was_live:
-                    self.changes['lost'].append({
-                        'type': '❌ LOST',
-                        'broker': broker,
-                        'station': station,
-                        'service': 'Drive365'
-                    })
-        
-        logger.info(f"Changes detected: {len(self.changes['new'])} NEW, {len(self.changes['lost'])} LOST")
+    # Column widths
+    ws.column_dimensions["A"].width = 28
+    for c in range(2, total_cols + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 14
+
+
+# ──────────────────────────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────────────────────────
+
+def run_checks(brand, areas, brokers):
+    """Run all availability checks for a brand."""
+    results = {}
+    total_checks = sum(len(city_list) for city_list in areas.values()) * len(brokers)
+    done = 0
     
-    def create_summary_sheets(self) -> Dict[str, List[List[str]]]:
-        """Create all sheet data"""
-        sheets = {}
-        
-        # 1. Summary by Broker
-        sheets['Summary by Broker'] = self._create_broker_summary()
-        
-        # 2. Summary by Location
-        sheets['Summary by Location'] = self._create_location_summary()
-        
-        # 3. Raw Data (all combinations)
-        sheets['Raw Data'] = self._create_raw_data()
-        
-        # 4. Changes Log
-        sheets['Changes'] = self._create_changes_log()
-        
-        return sheets
+    for broker in brokers:
+        results[broker] = {}
+        for country, city_list in areas.items():
+            for city in city_list:
+                done += 1
+                print(f"  [{done}/{total_checks}] {broker} → {city} ({country})...")
+                result = check_broker_availability(broker, brand, city)
+                results[broker][city] = result
+                time.sleep(1)  # Be polite with rate limiting
     
-    def _create_broker_summary(self) -> List[List[str]]:
-        """Show: Which stations does each broker HAVE (✅ LIVE)?"""
-        data = [['BROKER COVERAGE - WHERE THEY ARE LIVE', '', '', '']]
-        data.append(['Broker', 'Service', 'Live Locations', 'Count'])
-        
-        all_brokers = set(self.otaq_data.keys()) | set(self.drive365_data.keys())
-        
-        for broker in sorted(all_brokers):
-            # otoQ
-            otaq_stations = [
-                station for station, is_live in self.otaq_data.get(broker, {}).items()
-                if is_live
-            ]
-            if otaq_stations or broker in self.otaq_data:
-                data.append([
-                    broker,
-                    'otoQ',
-                    ', '.join(sorted(otaq_stations)) if otaq_stations else '—',
-                    str(len(otaq_stations))
-                ])
-            
-            # Drive365
-            d365_stations = [
-                station for station, is_live in self.drive365_data.get(broker, {}).items()
-                if is_live
-            ]
-            if d365_stations or broker in self.drive365_data:
-                data.append([
-                    broker,
-                    'Drive365',
-                    ', '.join(sorted(d365_stations)) if d365_stations else '—',
-                    str(len(d365_stations))
-                ])
-        
-        return data
-    
-    def _create_location_summary(self) -> List[List[str]]:
-        """Show: Which brokers ARE LIVE at each station?"""
-        data = [['COVERAGE BY LOCATION - WHICH BROKERS ARE LIVE', '', '', '']]
-        data.append(['Station', 'Service', 'Available Brokers', 'Count'])
-        
-        # Get all unique stations
-        all_stations = set()
-        for stations_dict in self.otaq_data.values():
-            all_stations.update(stations_dict.keys())
-        for stations_dict in self.drive365_data.values():
-            all_stations.update(stations_dict.keys())
-        
-        for station in sorted(all_stations):
-            # otoQ brokers at this station
-            otaq_brokers = [
-                broker for broker, stations in self.otaq_data.items()
-                if stations.get(station, False)
-            ]
-            
-            data.append([
-                station,
-                'otoQ',
-                ', '.join(sorted(otaq_brokers)) if otaq_brokers else '—',
-                str(len(otaq_brokers))
-            ])
-            
-            # Drive365 brokers at this station
-            d365_brokers = [
-                broker for broker, stations in self.drive365_data.items()
-                if stations.get(station, False)
-            ]
-            
-            data.append([
-                station,
-                'Drive365',
-                ', '.join(sorted(d365_brokers)) if d365_brokers else '—',
-                str(len(d365_brokers))
-            ])
-        
-        return data
-    
-    def _create_raw_data(self) -> List[List[str]]:
-        """Raw data for machine analysis"""
-        data = [['Broker', 'Station', 'Service', 'Status']]
-        
-        for broker in sorted(set(self.otaq_data.keys()) | set(self.drive365_data.keys())):
-            for station, is_live in self.otaq_data.get(broker, {}).items():
-                data.append([broker, station, 'otoQ', '✅ LIVE' if is_live else '❌ NOT LIVE'])
-            
-            for station, is_live in self.drive365_data.get(broker, {}).items():
-                data.append([broker, station, 'Drive365', '✅ LIVE' if is_live else '❌ NOT LIVE'])
-        
-        return data
-    
-    def _create_changes_log(self) -> List[List[str]]:
-        """Changes since last run"""
-        data = [['RECENT CHANGES', '', '']]
-        data.append(['Type', 'Broker', 'Station', 'Service'])
-        
-        for change in sorted(self.changes['new'], key=lambda x: x['broker']):
-            data.append(['✅ NEW', change['broker'], change['station'], change['service']])
-        
-        for change in sorted(self.changes['lost'], key=lambda x: x['broker']):
-            data.append(['❌ LOST', change['broker'], change['station'], change['service']])
-        
-        return data
-    
-    def update_sheets(self):
-        """Update all sheets in Google Sheets"""
-        sheets_data = self.create_summary_sheets()
-        
-        for sheet_name, data in sheets_data.items():
-            self._update_or_create_sheet(sheet_name, data)
-    
-    def _update_or_create_sheet(self, sheet_name: str, data: List[List[str]]):
-        """Update existing sheet or create new one"""
-        try:
-            range_name = f"{sheet_name}!A1"
-            body = {'values': data}
-            
-            self.sheet_service.spreadsheets().values().update(
-                spreadsheetId=self.spreadsheet_id,
-                range=range_name,
-                valueInputOption='RAW',
-                body=body
-            ).execute()
-            
-            logger.info(f"✓ Updated '{sheet_name}' ({len(data)} rows)")
-        except Exception as e:
-            logger.error(f"✗ Failed to update '{sheet_name}': {e}")
-    
-    def run(self):
-        """Execute the full tracker"""
-        logger.info("=" * 70)
-        logger.info("BROKER AVAILABILITY TRACKER - LIVE LOCATIONS")
-        logger.info("=" * 70)
-        
-        self.parse_broker_data()
-        self.load_previous_state()
-        self.detect_changes()
-        self.update_sheets()
-        
-        # Print summary
-        self._print_summary()
-    
-    def _print_summary(self):
-        """Print execution summary"""
-        otaq_live = sum(1 for stations in self.otaq_data.values() for is_live in stations.values() if is_live)
-        otaq_total = sum(len(stations) for stations in self.otaq_data.values())
-        
-        d365_live = sum(1 for stations in self.drive365_data.values() for is_live in stations.values() if is_live)
-        d365_total = sum(len(stations) for stations in self.drive365_data.values())
-        
-        logger.info("=" * 70)
-        logger.info("SUMMARY")
-        logger.info("=" * 70)
-        logger.info(f"otoQ: {otaq_live}/{otaq_total} broker-station combinations LIVE")
-        logger.info(f"Drive365: {d365_live}/{d365_total} broker-station combinations LIVE")
-        logger.info(f"\nChanges: {len(self.changes['new'])} NEW, {len(self.changes['lost'])} LOST")
-        
-        if self.changes['new']:
-            logger.info("\n✅ NEW locations:")
-            for change in self.changes['new'][:3]:
-                logger.info(f"   {change['broker']} → {change['station']} ({change['service']})")
-            if len(self.changes['new']) > 3:
-                logger.info(f"   ... and {len(self.changes['new']) - 3} more")
-        
-        if self.changes['lost']:
-            logger.info("\n❌ LOST locations:")
-            for change in self.changes['lost'][:3]:
-                logger.info(f"   {change['broker']} ✗ {change['station']} ({change['service']})")
-            if len(self.changes['lost']) > 3:
-                logger.info(f"   ... and {len(self.changes['lost']) - 3} more")
-        
-        logger.info("=" * 70)
-        logger.info("✅ TRACKER COMPLETED")
-        logger.info("=" * 70)
+    return results
 
 
 def main():
-    """Main entry point"""
-    creds = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
-    spreadsheet_id = os.getenv('SPREADSHEET_ID')
+    output_file = os.environ.get("OUTPUT_FILE", "Broker_Availability_Tracker.xlsx")
     
-    if not creds or not spreadsheet_id:
-        logger.error("Missing environment variables:")
-        logger.error("  GOOGLE_SHEETS_CREDENTIALS")
-        logger.error("  SPREADSHEET_ID")
-        return 1
+    print("=" * 60)
+    print("Broker Availability Tracker")
+    print("=" * 60)
     
-    try:
-        tracker = BrokerTracker(creds, spreadsheet_id)
-        tracker.run()
-        return 0
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        return 1
+    print(f"\n--- Checking otoQ ({len(OTOQ_BROKERS)} brokers, "
+          f"{sum(len(v) for v in OTOQ_AREAS.values())} locations) ---")
+    otoq_results = run_checks("otoQ", OTOQ_AREAS, OTOQ_BROKERS)
+    
+    print(f"\n--- Checking Drive365 ({len(DRIVE365_BROKERS)} brokers, "
+          f"{sum(len(v) for v in DRIVE365_AREAS.values())} locations) ---")
+    drive365_results = run_checks("Drive365", DRIVE365_AREAS, DRIVE365_BROKERS)
+    
+    print(f"\n--- Writing results to {output_file} ---")
+    write_excel(otoq_results, drive365_results, output_file)
+    
+    print("\nDone!")
 
 
-if __name__ == '__main__':
-    exit(main())
+if __name__ == "__main__":
+    main()
