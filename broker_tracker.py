@@ -10,7 +10,7 @@ Every single broker has its own agent class with:
 
 Strategy A — Supplier-page existence check (HTTP HEAD/GET → 200/404)
 Strategy B — Location/search-page scan (HTTP GET body text search)
-Strategy C — Playwright headless browser (for JS-only rendered sites)
+Strategy C — Playwright headless browser (auto-fallback for all HTTP failures)
 
 Results → Google Sheets (otoQ, Drive365, Diagnostics) + local .xlsx
 """
@@ -28,7 +28,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 try:
-    from playwright.async_api import async_playwright
+    from playwright.sync_api import sync_playwright
     HAS_PW = True
 except ImportError:
     HAS_PW = False
@@ -292,31 +292,145 @@ DL: list[D] = []
 # ═══════════════════════════════════════════════════════════════════════
 # HTTP HELPERS
 # ═══════════════════════════════════════════════════════════════════════
-H = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-     "Accept":"text/html,application/xhtml+xml,*/*;q=0.8","Accept-Language":"en-US,en;q=0.5"}
+H = {
+    "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language":"en-US,en;q=0.9",
+    "Accept-Encoding":"gzip, deflate, br",
+    "Connection":"keep-alive",
+    "Upgrade-Insecure-Requests":"1",
+    "Cache-Control":"max-age=0",
+}
 
 def hx(url, t=20):
-    """HTTP exists: True=200, False=404, None=error."""
+    """HTTP exists: True=200, False=404, None=error → PW fallback."""
     try:
         r=requests.get(url,headers=H,timeout=t,allow_redirects=True)
         if r.status_code==200: return True
         if r.status_code in(404,410): return False
     except: pass
-    return None
+    return pw_exists(url)
 
 def hc(url, needles, t=25):
-    """HTTP contains: True=found, False=not found, None=error."""
+    """HTTP contains: True=found, False=not found, None=error → PW fallback."""
     try:
         r=requests.get(url,headers=H,timeout=t,allow_redirects=True)
-        if r.status_code!=200: return None
-        txt=r.text.lower()
-        for n in needles:
-            if n.lower() in txt: return True
-        return False
-    except: return None
+        if r.status_code==200:
+            txt=r.text.lower()
+            for n in needles:
+                if n.lower() in txt: return True
+            return False
+    except: pass
+    return pw_scan(url, needles)
 
 def bn(brand):
     return BN.get(brand,[])+[brand.lower()]
+
+# ═══════════════════════════════════════════════════════════════════════
+# PLAYWRIGHT — shared browser, sync API, stealth patches
+# ═══════════════════════════════════════════════════════════════════════
+_PW_INST  = None
+_PW_BROW  = None
+
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+window.chrome = {runtime: {}};
+"""
+
+def _pw_browser():
+    global _PW_INST, _PW_BROW
+    if not HAS_PW:
+        return None
+    if _PW_BROW is None:
+        print("[PW] Launching Chromium…")
+        _PW_INST = sync_playwright().start()
+        _PW_BROW = _PW_INST.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-infobars",
+                "--window-size=1366,768",
+            ]
+        )
+    return _PW_BROW
+
+def _pw_new_page():
+    browser = _pw_browser()
+    if not browser:
+        return None, None
+    ctx = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        viewport={"width": 1366, "height": 768},
+        locale="en-US",
+        timezone_id="Europe/Athens",
+        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+    )
+    page = ctx.new_page()
+    page.add_init_script(_STEALTH_JS)
+    return page, ctx
+
+def pw_scan(url, needles, extra_wait=4000):
+    """Playwright: load page, wait, scan for any needle. Returns True/False/None."""
+    try:
+        page, ctx = _pw_new_page()
+        if page is None:
+            return None
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(extra_wait)
+            txt = page.evaluate("document.body.innerText").lower()
+            for n in needles:
+                if n.lower() in txt:
+                    return True
+            return False
+        finally:
+            try: page.close()
+            except: pass
+            try: ctx.close()
+            except: pass
+    except Exception as e:
+        print(f"  [PW scan ERR] {url}: {e}")
+        return None
+
+def pw_exists(url, extra_wait=2000):
+    """Playwright: check if page exists (True) or 404 (False) or error (None)."""
+    try:
+        page, ctx = _pw_new_page()
+        if page is None:
+            return None
+        try:
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=35000)
+            page.wait_for_timeout(extra_wait)
+            if resp and resp.status == 404:
+                return False
+            # Also check page text for "not found" patterns
+            txt = page.evaluate("document.body.innerText").lower()
+            if ("404" in txt or "page not found" in txt or "not found" in txt) and len(txt) < 2000:
+                return False
+            return True
+        finally:
+            try: page.close()
+            except: pass
+            try: ctx.close()
+            except: pass
+    except Exception as e:
+        print(f"  [PW exists ERR] {url}: {e}")
+        return None
+
+def pw_close():
+    global _PW_INST, _PW_BROW
+    try:
+        if _PW_BROW: _PW_BROW.close()
+    except: pass
+    try:
+        if _PW_INST: _PW_INST.stop()
+    except: pass
 
 # ═══════════════════════════════════════════════════════════════════════
 # PER-BROKER AGENTS — each fully customized
@@ -328,7 +442,7 @@ class Ag:
 
 # ─── 1. Discovercars.com ─────────────────────────────────────────────
 # Strategy A: /partners/{brand_slug}-{loc_code} → 200=✔, 404=✖
-# Fallback: scan location page /greece-crete/heraklion/her for brand text
+# Fallback: scan location page for brand text
 class DiscoverCars(Ag):
     N="Discovercars.com"
     def ck(self,city,brand):
@@ -346,9 +460,8 @@ class DiscoverCars(Ag):
         DL.append(D(self.N,city,brand,"http","Ambiguous")); return "N/A"
 
 # ─── 2. Qeeq.com ─────────────────────────────────────────────────────
-# Strategy B: scan airport location page for brand text
+# Static airport info page lists all suppliers — Playwright needed (bot-protected)
 # URL: /car/car-rental-pro/airport/{country-city-iata}
-# Supplier filter label: displayed as supplier logos/names in listing
 class Qeeq(Ag):
     N="Qeeq.com"
     def ck(self,city,brand):
@@ -358,12 +471,10 @@ class Qeeq(Ag):
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 3. Orbitcarhire.com ─────────────────────────────────────────────
-# Strategy B: scan search results page
-# URL: /search-results?loc={slug}&puDate=...&doDate=...
-# Supplier filter: sidebar checkbox list labeled "Supplier"
+# Search results page — supplier list in sidebar
 class OrbitCarHire(Ag):
     N="Orbitcarhire.com"
     def ck(self,city,brand):
@@ -373,28 +484,23 @@ class OrbitCarHire(Ag):
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 4. carrental.hotelbeds.com ──────────────────────────────────────
-# Strategy B: scan search page
-# URL: /search?location={query}&pickupDate=...&dropoffDate=...
-# Supplier filter: "Car Rental Company" dropdown in filters
+# Search page — uses location query string
 class Hotelbeds(Ag):
     N="carrental.hotelbeds.com"
     def ck(self,city,brand):
-        slug=AP.get(city,{}).get("hotelbeds")
-        if not slug: DL.append(D(self.N,city,brand,"url","No hotelbeds slug")); return "N/A"
         q=AP.get(city,{}).get("q","")
+        if not q: DL.append(D(self.N,city,brand,"url","No query")); return "N/A"
         url=f"https://carrental.hotelbeds.com/search?location={q}&pickupDate={PU}&dropoffDate={DO}&pickupTime={PUT}&dropoffTime={DOT}&driverAge={AGE}"
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 5. Enjoytravel.com ──────────────────────────────────────────────
-# Strategy B: scan search results
-# URL: /en/car-rental/search?pickUp={IATA}&dropOff={IATA}&dateFrom=...
-# Supplier filter: "Suppliers" checkbox section in left sidebar
+# Search results — supplier checkboxes in left sidebar
 class EnjoyTravel(Ag):
     N="Enjoytravel.com"
     def ck(self,city,brand):
@@ -404,47 +510,38 @@ class EnjoyTravel(Ag):
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 6. Aurumcars.de ─────────────────────────────────────────────────
-# Strategy B: scan search results page
-# URL: /en/search?location={query}&from=...&to=...
-# Supplier filter: "Supplier" checkboxes in filter panel
+# Search results page — supplier checkboxes
 class AurumCars(Ag):
     N="Aurumcars.de"
     def ck(self,city,brand):
-        slug=AP.get(city,{}).get("aurum")
-        if not slug: DL.append(D(self.N,city,brand,"url","No aurum slug")); return "N/A"
         q=AP.get(city,{}).get("q","")
+        if not q: DL.append(D(self.N,city,brand,"url","No query")); return "N/A"
         url=f"https://www.aurumcars.de/en/search?location={q}&from={PU}&to={DO}&pickup_time={PUT}&dropoff_time={DOT}&driver_age={AGE}"
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 7. Carjet.com ───────────────────────────────────────────────────
-# Strategy B: scan search results
-# URL: /search#puLoc={IATA}&doLoc={IATA}&puDate=...&doDate=...
-# Supplier filter: "Company" or "Supplier" in left sidebar
-# NOTE: Carjet uses hash-based routing → HTTP scan may get empty page
-# Fallback needed: Playwright or N/A with diagnostic
+# Uses JS hash routing — MUST use Playwright, skip HTTP entirely
+# Try both the city landing page (lists all suppliers) and the search hash URL
 class Carjet(Ag):
     N="Carjet.com"
     def ck(self,city,brand):
         iata=AP.get(city,{}).get("carjet")
         if not iata: DL.append(D(self.N,city,brand,"url","No IATA")); return "N/A"
-        # Carjet uses JS hash routing — try base URL scan
+        # City landing page (static, lists available suppliers)
         url=f"https://www.carjet.com/en/car-hire/{iata.lower()}"
-        r=hc(url,bn(brand))
+        r=pw_scan(url, bn(brand), extra_wait=5000)
         if r is True: return "✔"
         if r is False: return "✖"
-        # Carjet is JS-heavy, may need Playwright
-        DL.append(D(self.N,city,brand,"http",f"JS-rendered site, HTTP scan insufficient for {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"PW scan failed: {url}")); return "N/A"
 
 # ─── 8. Rentcars.com/en ──────────────────────────────────────────────
-# Strategy B: scan search results
-# URL: /en/search?location={slug}&from=...&to=...
-# Supplier filter: "Rental Company" checkbox filter
+# Search results — "Rental Company" checkbox filter
 class Rentcars(Ag):
     N="Rentcars.com/en"
     def ck(self,city,brand):
@@ -454,12 +551,10 @@ class Rentcars(Ag):
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 9. CarFlexi.com ─────────────────────────────────────────────────
-# Strategy B: scan search results
-# URL: /search?pickup={IATA}&from=...&to=...
-# Supplier filter: "Vendor" dropdown
+# Search results — "Vendor" dropdown
 class CarFlexi(Ag):
     N="CarFlexi.com"
     def ck(self,city,brand):
@@ -469,11 +564,10 @@ class CarFlexi(Ag):
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 10. Economybookings.com ─────────────────────────────────────────
 # Strategy A: /en/suppliers/{brand_slug}/{iata} → 200=✔, 404=✖
-# Known pattern from web research; otoQ confirmed at /en/suppliers/otoq/her
 class EconomyBookings(Ag):
     N="Economybookings.com"
     def ck(self,city,brand):
@@ -483,34 +577,27 @@ class EconomyBookings(Ag):
         r=hx(f"https://www.economybookings.com/en/suppliers/{slug}/{iata.lower()}")
         if r is True: return "✔"
         if r is False: return "✖"
-        # fallback city name
         cs=city.lower().replace(" ","-")
         r2=hx(f"https://www.economybookings.com/en/suppliers/{slug}/{cs}")
         if r2 is True: return "✔"
         if r2 is False: return "✖"
-        DL.append(D(self.N,city,brand,"http","Ambiguous")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw","Ambiguous after PW fallback")); return "N/A"
 
 # ─── 11. Priceline.com/rental-cars ───────────────────────────────────
-# Strategy B: scan search/results page
-# URL: /rental-cars/search?pickUp={IATA}&pickUpDate=...
-# Supplier filter: "Company" in filter sidebar
-# NOTE: Priceline is heavily JS-rendered
+# Heavily JS-rendered — Playwright only, needs extra wait for results
 class Priceline(Ag):
     N="Priceline.com/rental-cars"
     def ck(self,city,brand):
         iata=AP.get(city,{}).get("priceline")
         if not iata: DL.append(D(self.N,city,brand,"url","No IATA")); return "N/A"
-        pd=datetime.strptime(PU,"%Y-%m-%d"); dd=datetime.strptime(DO,"%Y-%m-%d")
         url=f"https://www.priceline.com/rental-cars/{iata.lower()}"
-        r=hc(url,bn(brand))
+        r=pw_scan(url, bn(brand), extra_wait=6000)
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"JS-rendered, scan insufficient for {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"PW scan failed: {url}")); return "N/A"
 
 # ─── 12. Rentcarla.com ───────────────────────────────────────────────
-# Strategy B: scan search/location page
-# URL: /search?location={slug}&from=...&to=...
-# Supplier filter: "Supplier" in left sidebar
+# Search results — "Supplier" in left sidebar
 class RentCarla(Ag):
     N="Rentcarla.com"
     def ck(self,city,brand):
@@ -521,13 +608,10 @@ class RentCarla(Ag):
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 13. Vipcars.com ─────────────────────────────────────────────────
-# Strategy B: scan airport location page for brand text
-# URL: /car-rental/{country}/{city}/{airport}
-# Supplier names appear in page text ("OtoQ" confirmed in Athens page)
-# Supplier filter: "Supplier" checkbox list in search results
+# Static airport page lists suppliers — Playwright needed (bot-protected)
 class VipCars(Ag):
     N="Vipcars.com"
     def ck(self,city,brand):
@@ -537,28 +621,23 @@ class VipCars(Ag):
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 14. Yolcu360 ────────────────────────────────────────────────────
-# Strategy B: scan location/search page
-# URL: /en/car-rental/{slug}
-# Supplier filter: "Company" or "Vendor" toggle in filter area
+# JS-heavy search page — Playwright with extra wait
 class Yolcu360(Ag):
     N="Yolcu360"
     def ck(self,city,brand):
-        slug=AP.get(city,{}).get("yolcu")
-        if not slug: DL.append(D(self.N,city,brand,"url","No yolcu slug")); return "N/A"
         q=AP.get(city,{}).get("q","")
+        if not q: DL.append(D(self.N,city,brand,"url","No query")); return "N/A"
         url=f"https://www.yolcu360.com/en/car-rental?pickUp={q}&pickUpDate={PU}&dropOffDate={DO}&pickUpTime={PUT}&dropOffTime={DOT}&age={AGE}"
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 15. Wisecars.com ────────────────────────────────────────────────
-# Strategy B: scan airport location page
-# URL: /en-us/car-rental/{city}/{airport}
-# Supplier filter: "Supplier" section on page
+# Static airport page lists suppliers — Playwright needed
 class WiseCars(Ag):
     N="Wisecars.com"
     def ck(self,city,brand):
@@ -568,12 +647,10 @@ class WiseCars(Ag):
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 16. BSP-auto.com ────────────────────────────────────────────────
-# Strategy B: scan search page
-# URL: /en/search?location={query}&from=...&to=...
-# Supplier filter: "Company" in filter panel
+# Search results — "Company" filter panel
 class BSPAuto(Ag):
     N="BSP-auto.com"
     def ck(self,city,brand):
@@ -583,12 +660,10 @@ class BSPAuto(Ag):
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 17. StressFreeCarRental.com ─────────────────────────────────────
-# Strategy B: scan search page
-# URL: /search?location={query}&from=...&to=...
-# Supplier filter: "Rental Company" in sidebar
+# Search results — "Rental Company" sidebar
 class StressFree(Ag):
     N="StressFreeCarRental.com"
     def ck(self,city,brand):
@@ -598,7 +673,7 @@ class StressFree(Ag):
         r=hc(url,bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N,city,brand,"http",f"Unreadable {url}")); return "N/A"
+        DL.append(D(self.N,city,brand,"pw",f"Both methods failed: {url}")); return "N/A"
 
 # ─── 18. otoQ.rent (own brand website) ───────────────────────────────
 class OtoqRent(Ag):
@@ -634,7 +709,7 @@ def build_tasks():
     for br in OTOQ_BROKERS:
         for _,cl in OTOQ_AREAS.items():
             for ci in cl:
-                t.setdefault((br,ci),[]); 
+                t.setdefault((br,ci),[]);
                 if "otoQ" not in t[(br,ci)]: t[(br,ci)].append("otoQ")
     for br in DRIVE365_BROKERS:
         for _,cl in DRIVE365_AREAS.items():
@@ -661,7 +736,7 @@ def run():
             if done%25==0 or done==tot: print(f"  [{done}/{tot}] {br} → {ci} ({b})")
             r=ag.ck(ci,b)
             res.setdefault(br,{}).setdefault(ci,{})[b]=r
-            time.sleep(0.25)
+            time.sleep(0.3)
     return res
 
 def extract(ar,brand,areas,brokers):
@@ -778,6 +853,7 @@ def main():
     print(f"  Diag: {len(DL)}")
     print(f"\n--- Excel ---");wx(oq,d3,fn)
     print("--- Sheets ---");ug(oq,d3)
+    pw_close()
     print("\nDone!")
 
 if __name__=="__main__": main()
