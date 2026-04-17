@@ -1,0 +1,41 @@
+name: Broker Recon (Step 1 — Diagnostics only)
+
+# Step 1 is manual-only. It does NOT update the main otoQ / Drive365 sheets.
+# Run it from the GitHub Actions tab: Actions → "Broker Recon" → Run workflow.
+# Output lands in the spreadsheet as tab: "Recon_Diagnostics".
+
+on:
+  workflow_dispatch:
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install chromium --with-deps
+
+      - name: Run recon
+        env:
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: python broker_recon.py
+
+      - name: Completion log
+        if: always()
+        run: echo "Recon finished at $(date -u). Check 'Recon_Diagnostics' tab."
