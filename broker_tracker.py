@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 """
-Broker Availability Tracker v3 — Fixed HTTP/Playwright Logic
-=============================================================
-Changes from v2:
- • hc()  — now falls through to Playwright whenever HTTP 200 doesn't find the
-           needle in static HTML (fixes false ✖ on JS-rendered supplier lists).
- • hx()  — now detects soft-404s (redirects to homepage, thin bodies, "not
-           found" markers) so non-existent partner pages no longer return ✔.
- • pw_scan — waits for network idle, scrolls to trigger lazy loaders, longer
-           total wait (fixes false ✖ on heavy-JS brokers like Priceline/Carjet).
- • pw_exists — verifies final URL wasn't redirected away + better 404 text check.
-
-Outputs: Google Sheets (otoQ, Drive365, Diagnostics) + local .xlsx
+Broker Availability Tracker v2 — Parallel Edition
+===================================================
+Fixed: async_playwright → sync_playwright, HTTP→PW fallback,
+       ThreadPoolExecutor (5 workers) to avoid 60-min timeout.
 """
 
-import json, os, re, sys, time, traceback
+import json, os, threading, time, traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional
-from urllib.parse import urlparse
 
 import requests
 import gspread
@@ -36,7 +27,6 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════
-
 def compute_dates():
     c = datetime.now() + timedelta(days=14)
     while c.weekday() >= 5: c += timedelta(days=1)
@@ -73,7 +63,6 @@ DRIVE365_BROKERS = [
     "bsp-auto.com","Aurum","StressFreeCarRental.com","Drive365.rent",
 ]
 
-# ─── Airport metadata ────────────────────────────────────────────────
 AP = {
     "Athens":    {"iata":"ATH","q":"Athens+International+Airport","dc":"/greece/athens/ath",
                   "qeeq":"gr-athens-ath","vipcars":"greece/athens/athens-airport",
@@ -281,249 +270,157 @@ DC_LOC = {
 BN = {"otoQ":["otoq","oto q","oto-q"],"Drive365":["drive365","drive 365","drive-365"]}
 
 # ═══════════════════════════════════════════════════════════════════════
-# DIAGNOSTICS
+# DIAGNOSTICS  (thread-safe)
 # ═══════════════════════════════════════════════════════════════════════
 @dataclass
 class D:
     broker:str; city:str; brand:str; stage:str; detail:str
     ts:str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-DL: list[D] = []
+
+DL: list = []
+_DL_LOCK = threading.Lock()
+
+def dl_append(entry):
+    with _DL_LOCK:
+        DL.append(entry)
 
 # ═══════════════════════════════════════════════════════════════════════
-# HTTP HELPERS  (v3: soft-404 detection + PW-on-empty fallback)
+# PLAYWRIGHT — single browser, thread-local contexts
 # ═══════════════════════════════════════════════════════════════════════
-H = {
-    "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language":"en-US,en;q=0.9",
-    "Accept-Encoding":"gzip, deflate, br",
-    "Connection":"keep-alive",
-    "Upgrade-Insecure-Requests":"1",
-    "Cache-Control":"max-age=0",
-}
+_PW_INST   = None
+_PW_BROW   = None
+_PW_LOCK   = threading.Lock()
+_tl        = threading.local()   # thread-local context storage
 
-_SOFT404_MARKERS = (
-    "page not found", "not found", "404", "page you are looking for",
-    "this page doesn't exist", "page doesn't exist", "page no longer",
-    "sorry, we couldn't find", "oops", "error 404",
-)
-
-def _is_soft_404(text: str) -> bool:
-    t = (text or "").lower()
-    if len(t) < 800:
-        return True
-    head = t[:4000]
-    for m in _SOFT404_MARKERS:
-        if m in head:
-            return True
-    return False
-
-def hx(url, t=20):
-    """HTTP exists: True=legit page, False=404/redirect/soft-404, None=error → PW."""
-    try:
-        # Step 1: don't follow redirects — a legitimate partner URL shouldn't redirect away
-        r = requests.get(url, headers=H, timeout=t, allow_redirects=False)
-        if r.status_code in (301, 302, 303, 307, 308):
-            # Redirected → URL doesn't exist as a first-class page
-            return False
-        if r.status_code in (404, 410):
-            return False
-        if r.status_code == 200:
-            if _is_soft_404(r.text):
-                return False
-            return True
-    except Exception:
-        pass
-    return pw_exists(url)
-
-def hc(url, needles, t=25):
-    """HTTP contains. Returns True (found), False (confirmed absent after PW), None (error).
-    Key change vs v2: when HTTP 200 but needle not in static HTML, we now fall through
-    to Playwright instead of returning False — because many broker search pages are
-    JS-rendered and the supplier list only appears after JS runs."""
-    try:
-        r = requests.get(url, headers=H, timeout=t, allow_redirects=True)
-        if r.status_code == 200:
-            txt = r.text.lower()
-            for n in needles:
-                if n.lower() in txt:
-                    return True
-            # Static HTML doesn't contain needle → might be JS-rendered → PW fallback
-    except Exception:
-        pass
-    return pw_scan(url, needles)
-
-def bn(brand):
-    return BN.get(brand, []) + [brand.lower()]
-
-# ═══════════════════════════════════════════════════════════════════════
-# PLAYWRIGHT — shared browser, sync API, stealth, networkidle + scroll
-# ═══════════════════════════════════════════════════════════════════════
-_PW_INST = None
-_PW_BROW = None
-
-_STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-window.chrome = {runtime: {}};
+_STEALTH = """
+Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
+window.chrome={runtime:{}};
 """
+
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+       "AppleWebKit/537.36 (KHTML, like Gecko) "
+       "Chrome/125.0.0.0 Safari/537.36")
 
 def _pw_browser():
     global _PW_INST, _PW_BROW
     if not HAS_PW:
         return None
     if _PW_BROW is None:
-        print("[PW] Launching Chromium…")
-        _PW_INST = sync_playwright().start()
-        _PW_BROW = _PW_INST.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-infobars",
-                "--window-size=1366,768",
-            ],
-        )
+        with _PW_LOCK:
+            if _PW_BROW is None:
+                print("[PW] Launching Chromium…")
+                _PW_INST = sync_playwright().start()
+                _PW_BROW = _PW_INST.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox","--disable-blink-features=AutomationControlled",
+                          "--disable-dev-shm-usage","--disable-gpu","--disable-extensions"])
     return _PW_BROW
 
-def _pw_new_page():
+def _pw_page():
+    """Return a fresh page on a thread-local browser context."""
     browser = _pw_browser()
     if not browser:
         return None, None
-    ctx = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        viewport={"width": 1366, "height": 768},
-        locale="en-US",
-        timezone_id="Europe/Athens",
-        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-    )
-    page = ctx.new_page()
-    page.add_init_script(_STEALTH_JS)
-    return page, ctx
+    # Create context once per thread; reuse it
+    if not getattr(_tl, 'ctx', None):
+        _tl.ctx = browser.new_context(
+            user_agent=_UA,
+            viewport={"width":1366,"height":768},
+            locale="en-US",
+            timezone_id="Europe/Athens",
+        )
+    page = _tl.ctx.new_page()
+    page.add_init_script(_STEALTH)
+    return page, _tl.ctx
 
-def _goto_robust(page, url):
-    """Try networkidle first (JS fully settled), fall back to domcontentloaded."""
+def pw_scan(url, needles, wait_ms=2000):
+    """Playwright scan: True/False/None. Short timeout to avoid hanging."""
     try:
-        resp = page.goto(url, wait_until="networkidle", timeout=45000)
-        return resp, None
-    except Exception as e1:
-        try:
-            resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            return resp, None
-        except Exception as e2:
-            return None, f"{e1} / {e2}"
-
-def _scroll_full(page):
-    """Scroll through the page to trigger lazy loaders."""
-    try:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.33)")
-        page.wait_for_timeout(900)
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.66)")
-        page.wait_for_timeout(900)
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(900)
-        page.evaluate("window.scrollTo(0, 0)")
-    except Exception:
-        pass
-
-def pw_scan(url, needles, extra_wait=5000):
-    """Playwright: load page, wait for JS, scroll, scan for any needle.
-    Returns True/False/None."""
-    page = ctx = None
-    try:
-        page, ctx = _pw_new_page()
+        page, _ = _pw_page()
         if page is None:
             return None
-        _, err = _goto_robust(page, url)
-        if err:
-            print(f"  [PW scan goto ERR] {url}: {err}")
-            return None
-        page.wait_for_timeout(extra_wait)
-        _scroll_full(page)
         try:
-            txt = (page.evaluate("document.body.innerText || ''") or "").lower()
-        except Exception:
-            return None
-        for n in needles:
-            if n.lower() in txt:
-                return True
-        return False
-    except Exception as e:
-        print(f"  [PW scan ERR] {url}: {e}")
-        return None
-    finally:
-        try:
-            if page: page.close()
-        except Exception:
-            pass
-        try:
-            if ctx: ctx.close()
-        except Exception:
-            pass
-
-def pw_exists(url, extra_wait=2500):
-    """Playwright: True if page really exists, False if 404/soft-404/redirected, None on error."""
-    page = ctx = None
-    try:
-        page, ctx = _pw_new_page()
-        if page is None:
-            return None
-        resp, err = _goto_robust(page, url)
-        if err:
-            print(f"  [PW exists goto ERR] {url}: {err}")
-            return None
-        page.wait_for_timeout(extra_wait)
-        if resp and resp.status in (404, 410):
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(wait_ms)
+            txt = page.evaluate("document.body.innerText").lower()
+            for n in needles:
+                if n.lower() in txt:
+                    return True
             return False
-        # Check if final URL navigated away from our path (soft-404 via redirect)
+        finally:
+            try: page.close()
+            except: pass
+    except Exception as e:
+        return None
+
+def pw_exists(url):
+    """Playwright existence check: True=exists, False=404, None=error."""
+    try:
+        page, _ = _pw_page()
+        if page is None:
+            return None
         try:
-            final_url = page.url
-            target_path = urlparse(url).path.rstrip("/")
-            final_path = urlparse(final_url).path.rstrip("/")
-            if target_path and target_path != final_path:
-                # Redirected to a different path — likely doesn't exist
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_timeout(1000)
+            if resp and resp.status == 404:
                 return False
-        except Exception:
-            pass
-        try:
-            txt = (page.evaluate("document.body.innerText || ''") or "").lower()
-        except Exception:
-            txt = ""
-        if _is_soft_404(txt):
-            return False
-        return True
-    except Exception as e:
-        print(f"  [PW exists ERR] {url}: {e}")
+            txt = page.evaluate("document.body.innerText").lower()
+            if len(txt) < 500 and ("404" in txt or "not found" in txt):
+                return False
+            return True
+        finally:
+            try: page.close()
+            except: pass
+    except Exception:
         return None
-    finally:
-        try:
-            if page: page.close()
-        except Exception:
-            pass
-        try:
-            if ctx: ctx.close()
-        except Exception:
-            pass
 
 def pw_close():
     global _PW_INST, _PW_BROW
     try:
         if _PW_BROW: _PW_BROW.close()
-    except Exception:
-        pass
+    except: pass
     try:
         if _PW_INST: _PW_INST.stop()
-    except Exception:
-        pass
+    except: pass
 
 # ═══════════════════════════════════════════════════════════════════════
-# PER-BROKER AGENTS — unchanged from v2
+# HTTP HELPERS  (with PW fallback)
 # ═══════════════════════════════════════════════════════════════════════
+H = {
+    "User-Agent": _UA,
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
 
+def hx(url, t=15):
+    try:
+        r = requests.get(url, headers=H, timeout=t, allow_redirects=True)
+        if r.status_code == 200: return True
+        if r.status_code in (404, 410): return False
+    except: pass
+    return pw_exists(url)
+
+def hc(url, needles, t=15):
+    try:
+        r = requests.get(url, headers=H, timeout=t, allow_redirects=True)
+        if r.status_code == 200:
+            txt = r.text.lower()
+            for n in needles:
+                if n.lower() in txt: return True
+            return False
+    except: pass
+    return pw_scan(url, needles)
+
+def bn(brand):
+    return BN.get(brand, []) + [brand.lower()]
+
+# ═══════════════════════════════════════════════════════════════════════
+# BROKER AGENTS
+# ═══════════════════════════════════════════════════════════════════════
 class Ag:
     N = "Base"
     def ck(self, city, brand): return "N/A"
@@ -532,8 +429,7 @@ class DiscoverCars(Ag):
     N = "Discovercars.com"
     def ck(self, city, brand):
         lc = DC_LOC.get(city)
-        if not lc:
-            DL.append(D(self.N, city, brand, "url", "No DC loc")); return "N/A"
+        if not lc: dl_append(D(self.N,city,brand,"url","No DC loc")); return "N/A"
         slug = "otoq" if brand == "otoQ" else "drive365"
         r = hx(f"https://www.discovercars.com/partners/{slug}-{lc}")
         if r is True: return "✔"
@@ -543,111 +439,102 @@ class DiscoverCars(Ag):
             r2 = hc(f"https://www.discovercars.com{dc}", bn(brand))
             if r2 is True: return "✔"
             if r2 is False: return "✖"
-        DL.append(D(self.N, city, brand, "http", "Ambiguous")); return "N/A"
+        dl_append(D(self.N,city,brand,"http","Ambiguous")); return "N/A"
 
 class Qeeq(Ag):
     N = "Qeeq.com"
     def ck(self, city, brand):
         slug = AP.get(city, {}).get("qeeq")
-        if not slug:
-            DL.append(D(self.N, city, brand, "url", "No qeeq slug")); return "N/A"
+        if not slug: dl_append(D(self.N,city,brand,"url","No slug")); return "N/A"
         url = f"https://www.qeeq.com/car/car-rental-pro/airport/{slug}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class OrbitCarHire(Ag):
     N = "Orbitcarhire.com"
     def ck(self, city, brand):
         slug = AP.get(city, {}).get("orbit")
-        if not slug:
-            DL.append(D(self.N, city, brand, "url", "No orbit slug")); return "N/A"
+        if not slug: dl_append(D(self.N,city,brand,"url","No slug")); return "N/A"
         url = f"https://www.orbitcarhire.com/{slug}?puDate={PU}&doDate={DO}&puTime={PUT}&doTime={DOT}&driverAge={AGE}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class Hotelbeds(Ag):
     N = "carrental.hotelbeds.com"
     def ck(self, city, brand):
         q = AP.get(city, {}).get("q", "")
-        if not q:
-            DL.append(D(self.N, city, brand, "url", "No query")); return "N/A"
+        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
         url = f"https://carrental.hotelbeds.com/search?location={q}&pickupDate={PU}&dropoffDate={DO}&pickupTime={PUT}&dropoffTime={DOT}&driverAge={AGE}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class EnjoyTravel(Ag):
     N = "Enjoytravel.com"
     def ck(self, city, brand):
         iata = AP.get(city, {}).get("enjoytravel")
-        if not iata:
-            DL.append(D(self.N, city, brand, "url", "No IATA")); return "N/A"
+        if not iata: dl_append(D(self.N,city,brand,"url","No IATA")); return "N/A"
         url = f"https://www.enjoytravel.com/en/car-rental/search?pickUp={iata}&dropOff={iata}&dateFrom={PU}&dateTo={DO}&timeFrom={PUT}&timeTo={DOT}&age={AGE}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class AurumCars(Ag):
     N = "Aurumcars.de"
     def ck(self, city, brand):
         q = AP.get(city, {}).get("q", "")
-        if not q:
-            DL.append(D(self.N, city, brand, "url", "No query")); return "N/A"
+        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
         url = f"https://www.aurumcars.de/en/search?location={q}&from={PU}&to={DO}&pickup_time={PUT}&dropoff_time={DOT}&driver_age={AGE}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class Carjet(Ag):
-    """Carjet uses JS hash routing — Playwright only."""
     N = "Carjet.com"
     def ck(self, city, brand):
         iata = AP.get(city, {}).get("carjet")
-        if not iata:
-            DL.append(D(self.N, city, brand, "url", "No IATA")); return "N/A"
+        if not iata: dl_append(D(self.N,city,brand,"url","No IATA")); return "N/A"
+        # JS hash routing — skip HTTP, go straight to PW with extra wait
         url = f"https://www.carjet.com/en/car-hire/{iata.lower()}"
-        r = pw_scan(url, bn(brand), extra_wait=6000)
+        r = pw_scan(url, bn(brand), wait_ms=4000)
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"PW scan failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class Rentcars(Ag):
     N = "Rentcars.com/en"
     def ck(self, city, brand):
         slug = AP.get(city, {}).get("rentcars")
-        if not slug:
-            DL.append(D(self.N, city, brand, "url", "No rentcars slug")); return "N/A"
+        if not slug: dl_append(D(self.N,city,brand,"url","No slug")); return "N/A"
         url = f"https://www.rentcars.com/en/search/{slug}?from={PU}&to={DO}&pickup={PUT}&dropoff={DOT}&age={AGE}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class CarFlexi(Ag):
     N = "CarFlexi.com"
     def ck(self, city, brand):
         iata = AP.get(city, {}).get("carflexi")
-        if not iata:
-            DL.append(D(self.N, city, brand, "url", "No IATA")); return "N/A"
+        if not iata: dl_append(D(self.N,city,brand,"url","No IATA")); return "N/A"
         url = f"https://www.carflexi.com/search?pickup={iata}&dropoff={iata}&from={PU}&to={DO}&pickupTime={PUT}&dropoffTime={DOT}&age={AGE}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class EconomyBookings(Ag):
     N = "Economybookings.com"
     def ck(self, city, brand):
         iata = AP.get(city, {}).get("iata")
-        if not iata:
-            DL.append(D(self.N, city, brand, "url", "No IATA")); return "N/A"
+        if not iata: dl_append(D(self.N,city,brand,"url","No IATA")); return "N/A"
         slug = "otoq" if brand == "otoQ" else "drive365"
         r = hx(f"https://www.economybookings.com/en/suppliers/{slug}/{iata.lower()}")
         if r is True: return "✔"
@@ -656,92 +543,84 @@ class EconomyBookings(Ag):
         r2 = hx(f"https://www.economybookings.com/en/suppliers/{slug}/{cs}")
         if r2 is True: return "✔"
         if r2 is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", "Ambiguous after PW fallback")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw","Ambiguous")); return "N/A"
 
 class Priceline(Ag):
-    """Heavily JS-rendered — Playwright only with extra wait."""
     N = "Priceline.com/rental-cars"
     def ck(self, city, brand):
         iata = AP.get(city, {}).get("priceline")
-        if not iata:
-            DL.append(D(self.N, city, brand, "url", "No IATA")); return "N/A"
+        if not iata: dl_append(D(self.N,city,brand,"url","No IATA")); return "N/A"
         url = f"https://www.priceline.com/rental-cars/{iata.lower()}"
-        r = pw_scan(url, bn(brand), extra_wait=7000)
+        r = pw_scan(url, bn(brand), wait_ms=5000)
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"PW scan failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class RentCarla(Ag):
     N = "Rentcarla.com"
     def ck(self, city, brand):
         q = AP.get(city, {}).get("q", "")
-        if not q:
-            DL.append(D(self.N, city, brand, "url", "No query")); return "N/A"
+        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
         url = f"https://www.rentcarla.com/search?location={q}&from={PU}&to={DO}&pickupTime={PUT}&dropoffTime={DOT}&age={AGE}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class VipCars(Ag):
     N = "Vipcars.com"
     def ck(self, city, brand):
         slug = AP.get(city, {}).get("vipcars")
-        if not slug:
-            DL.append(D(self.N, city, brand, "url", "No vipcars slug")); return "N/A"
+        if not slug: dl_append(D(self.N,city,brand,"url","No slug")); return "N/A"
         url = f"https://www.vipcars.com/car-rental/{slug}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class Yolcu360(Ag):
     N = "Yolcu360"
     def ck(self, city, brand):
         q = AP.get(city, {}).get("q", "")
-        if not q:
-            DL.append(D(self.N, city, brand, "url", "No query")); return "N/A"
+        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
         url = f"https://www.yolcu360.com/en/car-rental?pickUp={q}&pickUpDate={PU}&dropOffDate={DO}&pickUpTime={PUT}&dropOffTime={DOT}&age={AGE}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class WiseCars(Ag):
     N = "Wisecars.com"
     def ck(self, city, brand):
         slug = AP.get(city, {}).get("wisecars")
-        if not slug:
-            DL.append(D(self.N, city, brand, "url", "No wisecars slug")); return "N/A"
+        if not slug: dl_append(D(self.N,city,brand,"url","No slug")); return "N/A"
         url = f"https://www.wisecars.com/en-us/car-rental/{slug}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class BSPAuto(Ag):
     N = "BSP-auto.com"
     def ck(self, city, brand):
         q = AP.get(city, {}).get("q", "")
-        if not q:
-            DL.append(D(self.N, city, brand, "url", "No query")); return "N/A"
+        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
         url = f"https://www.bsp-auto.com/en/search?location={q}&from={PU}&to={DO}&pickupTime={PUT}&dropoffTime={DOT}&age={AGE}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class StressFree(Ag):
     N = "StressFreeCarRental.com"
     def ck(self, city, brand):
         q = AP.get(city, {}).get("q", "")
-        if not q:
-            DL.append(D(self.N, city, brand, "url", "No query")); return "N/A"
+        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
         url = f"https://www.stressfreecarrental.com/search?location={q}&from={PU}&to={DO}&pickupTime={PUT}&dropoffTime={DOT}&driverAge={AGE}"
         r = hc(url, bn(brand))
         if r is True: return "✔"
         if r is False: return "✖"
-        DL.append(D(self.N, city, brand, "pw", f"Both methods failed: {url}")); return "N/A"
+        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
 
 class OtoqRent(Ag):
     N = "otoQ.rent"
@@ -752,62 +631,72 @@ class Drive365Rent(Ag):
     def ck(self, city, brand): return "✔" if brand == "Drive365" else "✖"
 
 AG = {
-    "Discovercars.com": DiscoverCars, "Qeeq.com": Qeeq,
-    "Orbitcarhire.com": OrbitCarHire, "carrental.hotelbeds.com": Hotelbeds,
-    "Enjoytravel.com": EnjoyTravel, "Aurumcars.de": AurumCars, "Aurum": AurumCars,
-    "Carjet.com": Carjet, "Rentcars.com/en": Rentcars, "CarFlexi.com": CarFlexi,
-    "Economybookings.com": EconomyBookings, "EconomyBookings.com": EconomyBookings,
-    "Priceline.com/rental-cars": Priceline, "Rentcarla.com": RentCarla,
-    "Vipcars.com": VipCars, "Yolcu360": Yolcu360, "Wisecars.com": WiseCars,
-    "BSP-auto.com": BSPAuto, "bsp-auto.com": BSPAuto,
-    "StressFreeCarRental.com": StressFree,
-    "otoQ.rent": OtoqRent, "Drive365.rent": Drive365Rent,
+    "Discovercars.com":DiscoverCars, "Qeeq.com":Qeeq,
+    "Orbitcarhire.com":OrbitCarHire, "carrental.hotelbeds.com":Hotelbeds,
+    "Enjoytravel.com":EnjoyTravel, "Aurumcars.de":AurumCars, "Aurum":AurumCars,
+    "Carjet.com":Carjet, "Rentcars.com/en":Rentcars, "CarFlexi.com":CarFlexi,
+    "Economybookings.com":EconomyBookings, "EconomyBookings.com":EconomyBookings,
+    "Priceline.com/rental-cars":Priceline, "Rentcarla.com":RentCarla,
+    "Vipcars.com":VipCars, "Yolcu360":Yolcu360, "Wisecars.com":WiseCars,
+    "BSP-auto.com":BSPAuto, "bsp-auto.com":BSPAuto,
+    "StressFreeCarRental.com":StressFree,
+    "otoQ.rent":OtoqRent, "Drive365.rent":Drive365Rent,
 }
 
-# ═══════════════════════════════════════════════════════════════════════
-# ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════════════
-BNM = {"EconomyBookings.com": "Economybookings.com", "bsp-auto.com": "BSP-auto.com", "Aurum": "Aurumcars.de"}
+BNM = {"EconomyBookings.com":"Economybookings.com","bsp-auto.com":"BSP-auto.com","Aurum":"Aurumcars.de"}
 
+# ═══════════════════════════════════════════════════════════════════════
+# ORCHESTRATOR  — parallel with ThreadPoolExecutor
+# ═══════════════════════════════════════════════════════════════════════
 def build_tasks():
     t = {}
     for br in OTOQ_BROKERS:
         for _, cl in OTOQ_AREAS.items():
             for ci in cl:
                 t.setdefault((br, ci), [])
-                if "otoQ" not in t[(br, ci)]:
-                    t[(br, ci)].append("otoQ")
+                if "otoQ" not in t[(br, ci)]: t[(br, ci)].append("otoQ")
     for br in DRIVE365_BROKERS:
         for _, cl in DRIVE365_AREAS.items():
             for ci in cl:
                 cn = BNM.get(br, br)
                 key = (cn, ci) if (cn, ci) in t else (br, ci)
                 t.setdefault(key, [])
-                if "Drive365" not in t[key]:
-                    t[key].append("Drive365")
+                if "Drive365" not in t[key]: t[key].append("Drive365")
     return t
 
 def run():
     tasks = build_tasks()
-    tot = sum(len(b) for b in tasks.values())
-    print(f"\n[RUN] {len(tasks)} combos, {tot} checks")
+    jobs = [(br, ci, b) for (br, ci), brands in tasks.items() for b in brands]
+    tot = len(jobs)
+    print(f"\n[RUN] {len(tasks)} combos, {tot} checks — 5 workers")
+
     res = {}
-    done = 0
-    for (br, ci), brands in tasks.items():
+    res_lock = threading.Lock()
+    done = [0]
+
+    def do_one(br, ci, b):
         cls = AG.get(br)
         if not cls:
-            for b in brands:
-                res.setdefault(br, {}).setdefault(ci, {})[b] = "N/A"
-                DL.append(D(br, ci, b, "url", "No agent"))
-            continue
-        ag = cls()
-        for b in brands:
-            done += 1
-            if done % 25 == 0 or done == tot:
-                print(f"  [{done}/{tot}] {br} → {ci} ({b})")
-            r = ag.ck(ci, b)
-            res.setdefault(br, {}).setdefault(ci, {})[b] = r
-            time.sleep(0.3)
+            dl_append(D(br, ci, b, "url", "No agent"))
+            return br, ci, b, "N/A"
+        try:
+            r = cls().ck(ci, b)
+        except Exception as e:
+            dl_append(D(br, ci, b, "err", str(e)[:200]))
+            r = "N/A"
+        with res_lock:
+            done[0] += 1
+            if done[0] % 20 == 0 or done[0] == tot:
+                print(f"  [{done[0]}/{tot}] {br} → {ci} ({b}) = {r}")
+        return br, ci, b, r
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = [ex.submit(do_one, br, ci, b) for br, ci, b in jobs]
+        for f in as_completed(futures):
+            br, ci, b, r = f.result()
+            with res_lock:
+                res.setdefault(br, {}).setdefault(ci, {})[b] = r
+
     return res
 
 def extract(ar, brand, areas, brokers):
@@ -829,11 +718,11 @@ def extract(ar, brand, areas, brokers):
 # ═══════════════════════════════════════════════════════════════════════
 def gsc():
     cj = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
-    if not cj:
-        print("WARN: no creds"); return None
+    if not cj: print("WARN: no creds"); return None
     return gspread.authorize(Credentials.from_service_account_info(
         json.loads(cj),
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]))
+        scopes=["https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"]))
 
 def sd(label, areas, brokers, res):
     cities = [(co, ci) for co, cl in areas.items() for ci in cl]
@@ -843,76 +732,74 @@ def sd(label, areas, brokers, res):
         r2.append(co if co != p else ""); p = co
     r3 = [""] + [ci for _, ci in cities]
     rows = [[br] + [res.get(br, {}).get(ci, "N/A") for _, ci in cities] for br in brokers]
-    return [r1, r2, r3] + rows + [[], [f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')} | Dates: {PU}→{DO}"]]
+    return [r1, r2, r3] + rows + [[], [f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')} | {PU}→{DO}"]]
 
 def dd():
-    return [["Timestamp", "Broker", "City", "Brand", "Stage", "Detail"]] + \
-           [[e.ts, e.broker, e.city, e.brand, e.stage, e.detail[:500]] for e in DL]
+    return [["Timestamp","Broker","City","Brand","Stage","Detail"]] + [
+        [e.ts, e.broker, e.city, e.brand, e.stage, e.detail[:500]] for e in DL]
 
 def ug(oq, d3):
     cl = gsc()
     if not cl: return
     sid = os.environ.get("SPREADSHEET_ID")
-    if not sid:
-        print("WARN: no SPREADSHEET_ID"); return
+    if not sid: print("WARN: no SPREADSHEET_ID"); return
     try:
         sh = cl.open_by_key(sid)
     except Exception as e:
-        print(f"ERR: {e}"); return
-    for title, data in [
-        ("otoQ", sd("otoQ", OTOQ_AREAS, OTOQ_BROKERS, oq)),
-        ("Drive365", sd("DRIVE365", DRIVE365_AREAS, DRIVE365_BROKERS, d3)),
-        ("Diagnostics", dd()),
-    ]:
+        print(f"ERR open sheet: {e}"); return
+    for title, data in [("otoQ", sd("otoQ", OTOQ_AREAS, OTOQ_BROKERS, oq)),
+                        ("Drive365", sd("DRIVE365", DRIVE365_AREAS, DRIVE365_BROKERS, d3)),
+                        ("Diagnostics", dd())]:
         try:
             ws = sh.worksheet(title); ws.clear()
         except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=title, rows=len(data) + 5, cols=max(len(r) for r in data) + 5)
+            ws = sh.add_worksheet(title=title,
+                                  rows=len(data)+5,
+                                  cols=max(len(r) for r in data)+5)
         ws.update(range_name="A1", values=data)
-        print(f"  ✔ '{title}'")
+        print(f"  ✔ Sheet '{title}'")
 
 # ═══════════════════════════════════════════════════════════════════════
 # LOCAL EXCEL
 # ═══════════════════════════════════════════════════════════════════════
 def xb(ws, label, areas, brokers, res):
     hw = Font(bold=True, size=11, name="Arial", color="FFFFFF")
-    cf = Font(italic=True, size=10, name="Arial"); df = Font(size=10, name="Arial")
+    cf = Font(italic=True, size=10, name="Arial")
+    df = Font(size=10, name="Arial")
     bf = Font(bold=True, size=14, name="Arial")
     ct = Alignment(horizontal="center", vertical="center")
     la = Alignment(horizontal="left", vertical="center")
-    gf = PatternFill("solid", fgColor="C6EFCE"); rf = PatternFill("solid", fgColor="FFC7CE")
-    gr = PatternFill("solid", fgColor="D9D9D9"); hd = PatternFill("solid", fgColor="4472C4")
+    gf = PatternFill("solid", fgColor="C6EFCE")
+    rf = PatternFill("solid", fgColor="FFC7CE")
+    gr = PatternFill("solid", fgColor="D9D9D9")
+    hd = PatternFill("solid", fgColor="4472C4")
     bd = Border(left=Side("thin"), right=Side("thin"), top=Side("thin"), bottom=Side("thin"))
     cities, spans = [], []; col = 2
     for co, cl in areas.items():
         s = col
-        for ci in cl:
-            cities.append((co, ci)); col += 1
-        spans.append((co, s, col - 1))
+        for ci in cl: cities.append((co, ci)); col += 1
+        spans.append((co, s, col-1))
     ws.cell(1, 1, label).font = bf
     for co, s, e in spans:
         c = ws.cell(2, s, co); c.font = hw; c.fill = hd; c.alignment = ct; c.border = bd
-        if s != e:
-            ws.merge_cells(start_row=2, start_column=s, end_row=2, end_column=e)
-        for x in range(s, e + 1):
-            ws.cell(2, x).border = bd; ws.cell(2, x).fill = hd
+        if s != e: ws.merge_cells(start_row=2, start_column=s, end_row=2, end_column=e)
+        for x in range(s, e+1): ws.cell(2, x).border = bd; ws.cell(2, x).fill = hd
     for i, (_, ci) in enumerate(cities):
-        c = ws.cell(3, i + 2, ci); c.font = cf; c.alignment = ct; c.border = bd
+        c = ws.cell(3, i+2, ci); c.font = cf; c.alignment = ct; c.border = bd
     for bi, br in enumerate(brokers):
-        r = 4 + bi
-        c = ws.cell(r, 1, br); c.font = df; c.alignment = la; c.border = bd
+        r = 4+bi; c = ws.cell(r, 1, br); c.font = df; c.alignment = la; c.border = bd
         for ci_i, (_, ci) in enumerate(cities):
             v = res.get(br, {}).get(ci, "N/A")
-            c = ws.cell(r, ci_i + 2, v); c.font = df; c.alignment = ct; c.border = bd
+            c = ws.cell(r, ci_i+2, v); c.font = df; c.alignment = ct; c.border = bd
             c.fill = gf if v == "✔" else rf if v == "✖" else gr
     ws.column_dimensions["A"].width = 28
-    for x in range(2, col):
-        ws.column_dimensions[get_column_letter(x)].width = 14
+    for x in range(2, col): ws.column_dimensions[get_column_letter(x)].width = 14
 
 def xd(ws):
-    hf = Font(bold=True, size=11, name="Arial"); df = Font(size=9, name="Arial")
+    hf = Font(bold=True, size=11, name="Arial")
+    df = Font(size=9, name="Arial")
     bd = Border(left=Side("thin"), right=Side("thin"), top=Side("thin"), bottom=Side("thin"))
-    for ci, h in enumerate(["Timestamp", "Broker", "City", "Brand", "Stage", "Detail"], 1):
+    for ci, h in enumerate(["Timestamp","Broker","City","Brand","Stage","Detail"], 1):
         c = ws.cell(1, ci, h); c.font = hf; c.border = bd
     for ri, e in enumerate(DL, 2):
         for ci, v in enumerate([e.ts, e.broker, e.city, e.brand, e.stage, e.detail[:500]], 1):
@@ -933,16 +820,25 @@ def wx(oq, d3, fn="Broker_Availability_Tracker.xlsx"):
 # ═══════════════════════════════════════════════════════════════════════
 def main():
     fn = os.environ.get("OUTPUT_FILE", "Broker_Availability_Tracker.xlsx")
-    print("=" * 60); print("Broker Availability Tracker v3"); print("=" * 60)
+    print("="*60)
+    print("Broker Availability Tracker v2 — Parallel Edition")
+    print("="*60)
+
+    # Pre-warm Playwright in main thread before spawning workers
+    if HAS_PW:
+        _pw_browser()
+
     ar = run()
     oq = extract(ar, "otoQ", OTOQ_AREAS, OTOQ_BROKERS)
     d3 = extract(ar, "Drive365", DRIVE365_AREAS, DRIVE365_BROKERS)
-    s = lambda r: tuple(sum(1 for b in r.values() for v in b.values() if v == x) for x in ("✔", "✖", "N/A"))
+
+    s = lambda r: tuple(sum(1 for b in r.values() for v in b.values() if v == x) for x in ("✔","✖","N/A"))
     o1, o2, o3 = s(oq); d1, d2, d3_ = s(d3)
-    print(f"\n  otoQ:     ✔{o1} ✖{o2} N/A {o3}")
-    print(f"  Drive365: ✔{d1} ✖{d2} N/A {d3_}")
-    print(f"  Diag: {len(DL)}")
-    print(f"\n--- Excel ---"); wx(oq, d3, fn)
+    print(f"\n  otoQ:     ✔{o1}  ✖{o2}  N/A {o3}")
+    print(f"  Drive365: ✔{d1}  ✖{d2}  N/A {d3_}")
+    print(f"  Diag entries: {len(DL)}")
+
+    print("\n--- Excel ---"); wx(oq, d3, fn)
     print("--- Sheets ---"); ug(oq, d3)
     pw_close()
     print("\nDone!")
