@@ -1,297 +1,180 @@
 #!/usr/bin/env python3
 """
-Broker Availability Tracker v2 — Parallel Edition
-===================================================
-Fixed: async_playwright → sync_playwright, HTTP→PW fallback,
-       ThreadPoolExecutor (5 workers) to avoid 60-min timeout.
+Broker Availability Tracker v3 — Async + Self-Discovering IDs
+==============================================================
+Architecture:
+  • CITY_IDS: static IDs known at write-time (Athens fully populated).
+  • city_ids_cache.json: auto-populated on first Playwright run.
+  • asyncio.gather with 6 concurrent pages, one browser context.
+  • WAF detection → N/A + diagnostic (never ✖ for bot-blocked pages).
+  • Brand regex: word-boundary, handles "oto q", "oto-q" etc.
+  • Full diagnostics: URL, status, content-len, body head, WAF flag.
 """
 
-import json, os, threading, time, traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio, base64, json, os, re, sys, time, traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
 
-import requests
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.async_api import async_playwright, Page, BrowserContext
     HAS_PW = True
 except ImportError:
     HAS_PW = False
+    print("WARN: playwright not installed")
 
-# ═══════════════════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════════════════
-def compute_dates():
-    c = datetime.now() + timedelta(days=14)
-    while c.weekday() >= 5: c += timedelta(days=1)
-    return c.strftime("%Y-%m-%d"), (c + timedelta(days=7)).strftime("%Y-%m-%d")
+# ─── DATES ───────────────────────────────────────────────────────────
+def _next_weekday(offset=14):
+    d = datetime.now() + timedelta(days=offset)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
 
-PU, DO = compute_dates()
+PU_D = _next_weekday(14)
+DO_D = PU_D + timedelta(days=7)
+PU   = PU_D.strftime("%Y-%m-%d")
+DO   = DO_D.strftime("%Y-%m-%d")
 PUT, DOT, AGE = "10:00", "10:00", 30
 print(f"[CONFIG] {PU} → {DO}")
 
+# ─── BRAND REGEX + WAF ───────────────────────────────────────────────
+BRAND_RE = {
+    "otoQ":    re.compile(r"\boto[\s\-]?q\b", re.I),
+    "Drive365": re.compile(r"\bdrive[\s\-]?365\b", re.I),
+}
+WAF_SIGNALS = ["just a moment","cf-challenge","cf_chl_opt","captcha",
+               "are you human","ddos-guard","access denied","403 forbidden","blocked"]
+
+def brand_found(html, brand):   return bool(BRAND_RE[brand].search(html))
+def is_waf(html):
+    if len(html) < 2000: return True
+    lo = html.lower()
+    return any(s in lo for s in WAF_SIGNALS)
+
+# ─── CITY IDS ────────────────────────────────────────────────────────
+# Athens fully populated from supplied URLs.
+# All other cities: iata only. Numeric IDs auto-discovered on first run
+# via Playwright form-navigation and cached to city_ids_cache.json.
+CITY_IDS = {
+    "Athens": {
+        "iata": "ATH",
+        "enjoytravel": 437,
+        "aurum_id": 9514, "aurum_name": "Athen Flughafen",
+        "rentcars": 3782,
+        "ebookings_plc": 1519, "ebookings_cr": 84,
+        "rentcarla": 428,
+        "vipcars_country": 62, "vipcars_city": 1259, "vipcars_loc": 482,
+        "hotelbeds_piata": 221,
+        "hotelbeds_label": "Athens Elefherios Venizelos International Airport (ATH)",
+        "discovercars": 1843,
+        "yolcu_pid": "ChIJYVzn2RqQoRQRqrPuCt8Vsjg",
+        "yolcu_pp":  "37.9415988,23.9477271",
+    },
+    "Zante":     {"iata":"ZTH"},
+    "Chania":    {"iata":"CHQ"},
+    "Heraklion": {"iata":"HER"},
+    "Valletta":  {"iata":"MLA"},
+    "Tirana":    {"iata":"TIA"},
+    "Tunis":     {"iata":"TUN"},
+    "Enfidha":   {"iata":"NBE"},
+    "Monastir":  {"iata":"MIR"},
+    "Djerba":    {"iata":"DJE"},
+    "Orlando":   {"iata":"MCO"},
+    "Miami":     {"iata":"MIA"},
+    "Tampa":     {"iata":"TPA"},
+    "Hollywood": {"iata":"FLL"},
+    "Rabat":     {"iata":"RBA"},
+    "Fez":       {"iata":"FEZ"},
+    "Tangier":   {"iata":"TNG"},
+    "Agadir":    {"iata":"AGA"},
+    "Marrakesh": {"iata":"RAK"},
+    "Casablanca":{"iata":"CMN"},
+    "Podgorica": {"iata":"TGD"},
+    "Tivat":     {"iata":"TIV"},
+    "Timisoara": {"iata":"TSR"},
+    "Plaisance": {"iata":"MRU"},
+}
+
+CACHE_PATH = Path("city_ids_cache.json")
+_CACHE: dict = {}
+
+def load_cache():
+    global _CACHE
+    if CACHE_PATH.exists():
+        try: _CACHE = json.loads(CACHE_PATH.read_text())
+        except Exception: _CACHE = {}
+
+def save_cache():
+    CACHE_PATH.write_text(json.dumps(_CACHE, indent=2))
+
+def cids(city):
+    base = dict(CITY_IDS.get(city, {}))
+    base.update(_CACHE.get(city, {}))
+    return base
+
+def cache_set(city, key, val):
+    _CACHE.setdefault(city, {})[key] = val
+    save_cache()
+
+# ─── AREAS & BROKERS ─────────────────────────────────────────────────
 OTOQ_AREAS = {
-    "Greece":["Athens","Zante","Chania","Heraklion"],
-    "Malta":["Valletta"],"Albania":["Tirana"],
-    "Tunisia":["Tunis","Enfidha","Monastir","Djerba"],
-    "United States":["Orlando","Miami","Tampa","Hollywood"],
-    "Morocco":["Rabat","Fez","Tangier","Agadir","Marrakesh","Casablanca"],
-    "Montenegro":["Podgorica"],"Romania":["Timisoara"],"Mauritius":["Plaisance"],
+    "Greece":        ["Athens","Zante","Chania","Heraklion"],
+    "Malta":         ["Valletta"],
+    "Albania":       ["Tirana"],
+    "Tunisia":       ["Tunis","Enfidha","Monastir","Djerba"],
+    "United States": ["Orlando","Miami","Tampa","Hollywood"],
+    "Morocco":       ["Rabat","Fez","Tangier","Agadir","Marrakesh","Casablanca"],
+    "Montenegro":    ["Podgorica"],
+    "Romania":       ["Timisoara"],
+    "Mauritius":     ["Plaisance"],
 }
 DRIVE365_AREAS = {
-    "Greece":["Heraklion","Athens"],"Albania":["Tirana"],
-    "United States":["Miami","Tampa","Hollywood","Orlando"],
-    "Malta":["Valletta"],"Montenegro":["Podgorica","Tivat"],
+    "Greece":        ["Heraklion","Athens"],
+    "Albania":       ["Tirana"],
+    "United States": ["Miami","Tampa","Hollywood","Orlando"],
+    "Malta":         ["Valletta"],
+    "Montenegro":    ["Podgorica","Tivat"],
 }
 OTOQ_BROKERS = [
     "Discovercars.com","Qeeq.com","Orbitcarhire.com",
     "carrental.hotelbeds.com","Enjoytravel.com","Aurumcars.de",
-    "Carjet.com","Rentcars.com/en","CarFlexi.com",
-    "Economybookings.com","Priceline.com/rental-cars","Rentcarla.com",
+    "Carjet.com","Rentcars.com","CarFlexi.com",
+    "Economybookings.com","Priceline.com","Rentcarla.com",
     "Vipcars.com","Yolcu360","Wisecars.com","BSP-auto.com",
     "StressFreeCarRental.com","otoQ.rent",
 ]
 DRIVE365_BROKERS = [
     "Discovercars.com","Orbitcarhire.com","Vipcars.com",
-    "Enjoytravel.com","Carjet.com","EconomyBookings.com",
-    "bsp-auto.com","Aurum","StressFreeCarRental.com","Drive365.rent",
+    "Enjoytravel.com","Carjet.com","Economybookings.com",
+    "BSP-auto.com","Aurumcars.de","StressFreeCarRental.com","Drive365.rent",
 ]
 
-AP = {
-    "Athens":    {"iata":"ATH","q":"Athens+International+Airport","dc":"/greece/athens/ath",
-                  "qeeq":"gr-athens-ath","vipcars":"greece/athens/athens-airport",
-                  "orbit":"athens-airport","wisecars":"athens/athens-airport",
-                  "carjet":"ATH","enjoytravel":"ATH","bsp":"athens-airport",
-                  "stressfree":"athens-airport","hotelbeds":"athens-airport",
-                  "rentcars":"athens-international-airport","carflexi":"ATH",
-                  "priceline":"ATH","rentcarla":"athens-airport","yolcu":"athens-airport",
-                  "aurum":"athens-airport"},
-    "Zante":     {"iata":"ZTH","q":"Zakynthos+Airport","dc":"/greece/zakynthos/zth",
-                  "qeeq":"gr-zakynthos-zth","vipcars":"greece/zakynthos/zakynthos-airport",
-                  "orbit":"zakynthos-airport","wisecars":"zakynthos/zakynthos-airport",
-                  "carjet":"ZTH","enjoytravel":"ZTH","bsp":"zakynthos-airport",
-                  "stressfree":"zakynthos-airport","hotelbeds":"zakynthos-airport",
-                  "rentcars":"zakynthos-airport","carflexi":"ZTH",
-                  "priceline":"ZTH","rentcarla":"zakynthos-airport","yolcu":"zakynthos-airport",
-                  "aurum":"zakynthos-airport"},
-    "Chania":    {"iata":"CHQ","q":"Chania+Airport","dc":"/greece-crete/chania/chq",
-                  "qeeq":"gr-crete-chq","vipcars":"greece/chania-crete-island/chania-airport",
-                  "orbit":"chania-airport","wisecars":"chania/chania-airport",
-                  "carjet":"CHQ","enjoytravel":"CHQ","bsp":"chania-airport",
-                  "stressfree":"chania-airport","hotelbeds":"chania-airport",
-                  "rentcars":"chania-airport","carflexi":"CHQ",
-                  "priceline":"CHQ","rentcarla":"chania-airport","yolcu":"chania-airport",
-                  "aurum":"chania-airport"},
-    "Heraklion": {"iata":"HER","q":"Heraklion+Airport","dc":"/greece-crete/heraklion/her",
-                  "qeeq":"gr-crete-her","vipcars":"greece/heraklion-crete-island/heraklion-airport",
-                  "orbit":"heraklion-airport","wisecars":"heraklion/heraklion-airport",
-                  "carjet":"HER","enjoytravel":"HER","bsp":"heraklion-airport",
-                  "stressfree":"heraklion-airport","hotelbeds":"heraklion-airport",
-                  "rentcars":"heraklion-airport","carflexi":"HER",
-                  "priceline":"HER","rentcarla":"heraklion-airport","yolcu":"heraklion-airport",
-                  "aurum":"heraklion-airport"},
-    "Valletta":  {"iata":"MLA","q":"Malta+International+Airport","dc":"/malta/luqa/mla",
-                  "qeeq":"mt-malta-mla","vipcars":"malta/malta/malta-airport",
-                  "orbit":"malta-airport","wisecars":"malta/malta-airport",
-                  "carjet":"MLA","enjoytravel":"MLA","bsp":"malta-airport",
-                  "stressfree":"malta-airport","hotelbeds":"malta-airport",
-                  "rentcars":"malta-airport","carflexi":"MLA",
-                  "priceline":"MLA","rentcarla":"malta-airport","yolcu":"malta-airport",
-                  "aurum":"malta-airport"},
-    "Tirana":    {"iata":"TIA","q":"Tirana+Airport","dc":"/albania/tirana/tia",
-                  "qeeq":"al-tirana-tia","vipcars":"albania/tirana/tirana-airport",
-                  "orbit":"tirana-airport","wisecars":"tirana/tirana-airport",
-                  "carjet":"TIA","enjoytravel":"TIA","bsp":"tirana-airport",
-                  "stressfree":"tirana-airport","hotelbeds":"tirana-airport",
-                  "rentcars":"tirana-airport","carflexi":"TIA",
-                  "priceline":"TIA","rentcarla":"tirana-airport","yolcu":"tirana-airport",
-                  "aurum":"tirana-airport"},
-    "Tunis":     {"iata":"TUN","q":"Tunis+Carthage+Airport","dc":"/tunisia/tunis/tun",
-                  "qeeq":"tn-tunis-tun","vipcars":"tunisia/tunis/tunis-airport",
-                  "orbit":"tunis-airport","wisecars":"tunis/tunis-airport",
-                  "carjet":"TUN","enjoytravel":"TUN","bsp":"tunis-airport",
-                  "stressfree":"tunis-airport","hotelbeds":"tunis-airport",
-                  "rentcars":"tunis-carthage-airport","carflexi":"TUN",
-                  "priceline":"TUN","rentcarla":"tunis-airport","yolcu":"tunis-airport",
-                  "aurum":"tunis-airport"},
-    "Enfidha":   {"iata":"NBE","q":"Enfidha+Airport","dc":"/tunisia/enfidha/nbe",
-                  "qeeq":"tn-enfidha-nbe","vipcars":"tunisia/enfidha/enfidha-airport",
-                  "orbit":"enfidha-airport","wisecars":"enfidha/enfidha-airport",
-                  "carjet":"NBE","enjoytravel":"NBE","bsp":"enfidha-airport",
-                  "stressfree":"enfidha-airport","hotelbeds":"enfidha-airport",
-                  "rentcars":"enfidha-airport","carflexi":"NBE",
-                  "priceline":"NBE","rentcarla":"enfidha-airport","yolcu":"enfidha-airport",
-                  "aurum":"enfidha-airport"},
-    "Monastir":  {"iata":"MIR","q":"Monastir+Airport","dc":"/tunisia/monastir/mir",
-                  "qeeq":"tn-monastir-mir","vipcars":"tunisia/monastir/monastir-airport",
-                  "orbit":"monastir-airport","wisecars":"monastir/monastir-airport",
-                  "carjet":"MIR","enjoytravel":"MIR","bsp":"monastir-airport",
-                  "stressfree":"monastir-airport","hotelbeds":"monastir-airport",
-                  "rentcars":"monastir-airport","carflexi":"MIR",
-                  "priceline":"MIR","rentcarla":"monastir-airport","yolcu":"monastir-airport",
-                  "aurum":"monastir-airport"},
-    "Djerba":    {"iata":"DJE","q":"Djerba+Airport","dc":"/tunisia/djerba/dje",
-                  "qeeq":"tn-djerba-dje","vipcars":"tunisia/djerba/djerba-airport",
-                  "orbit":"djerba-airport","wisecars":"djerba/djerba-airport",
-                  "carjet":"DJE","enjoytravel":"DJE","bsp":"djerba-airport",
-                  "stressfree":"djerba-airport","hotelbeds":"djerba-airport",
-                  "rentcars":"djerba-airport","carflexi":"DJE",
-                  "priceline":"DJE","rentcarla":"djerba-airport","yolcu":"djerba-airport",
-                  "aurum":"djerba-airport"},
-    "Orlando":   {"iata":"MCO","q":"Orlando+International+Airport","dc":"/united-states/orlando/mco",
-                  "qeeq":"us-orlando-mco","vipcars":"united-states/orlando/orlando-airport",
-                  "orbit":"orlando-airport","wisecars":"orlando/orlando-airport",
-                  "carjet":"MCO","enjoytravel":"MCO","bsp":"orlando-airport",
-                  "stressfree":"orlando-airport","hotelbeds":"orlando-airport",
-                  "rentcars":"orlando-international-airport","carflexi":"MCO",
-                  "priceline":"MCO","rentcarla":"orlando-airport","yolcu":"orlando-airport",
-                  "aurum":"orlando-airport"},
-    "Miami":     {"iata":"MIA","q":"Miami+International+Airport","dc":"/united-states/miami/mia",
-                  "qeeq":"us-miami-mia","vipcars":"united-states/miami/miami-airport",
-                  "orbit":"miami-airport","wisecars":"miami/miami-airport",
-                  "carjet":"MIA","enjoytravel":"MIA","bsp":"miami-airport",
-                  "stressfree":"miami-airport","hotelbeds":"miami-airport",
-                  "rentcars":"miami-international-airport","carflexi":"MIA",
-                  "priceline":"MIA","rentcarla":"miami-airport","yolcu":"miami-airport",
-                  "aurum":"miami-airport"},
-    "Tampa":     {"iata":"TPA","q":"Tampa+International+Airport","dc":"/united-states/tampa/tpa",
-                  "qeeq":"us-tampa-tpa","vipcars":"united-states/tampa/tampa-airport",
-                  "orbit":"tampa-airport","wisecars":"tampa/tampa-airport",
-                  "carjet":"TPA","enjoytravel":"TPA","bsp":"tampa-airport",
-                  "stressfree":"tampa-airport","hotelbeds":"tampa-airport",
-                  "rentcars":"tampa-international-airport","carflexi":"TPA",
-                  "priceline":"TPA","rentcarla":"tampa-airport","yolcu":"tampa-airport",
-                  "aurum":"tampa-airport"},
-    "Hollywood": {"iata":"FLL","q":"Fort+Lauderdale+Airport","dc":"/united-states/fort-lauderdale/fll",
-                  "qeeq":"us-fort-lauderdale-fll","vipcars":"united-states/fort-lauderdale/fort-lauderdale-airport",
-                  "orbit":"fort-lauderdale-airport","wisecars":"fort-lauderdale/fort-lauderdale-airport",
-                  "carjet":"FLL","enjoytravel":"FLL","bsp":"fort-lauderdale-airport",
-                  "stressfree":"fort-lauderdale-airport","hotelbeds":"fort-lauderdale-airport",
-                  "rentcars":"fort-lauderdale-airport","carflexi":"FLL",
-                  "priceline":"FLL","rentcarla":"fort-lauderdale-airport","yolcu":"fort-lauderdale-airport",
-                  "aurum":"fort-lauderdale-airport"},
-    "Rabat":     {"iata":"RBA","q":"Rabat+Airport","dc":"/morocco/rabat/rba",
-                  "qeeq":"ma-rabat-rba","vipcars":"morocco/rabat/rabat-airport",
-                  "orbit":"rabat-airport","wisecars":"rabat/rabat-airport",
-                  "carjet":"RBA","enjoytravel":"RBA","bsp":"rabat-airport",
-                  "stressfree":"rabat-airport","hotelbeds":"rabat-airport",
-                  "rentcars":"rabat-airport","carflexi":"RBA",
-                  "priceline":"RBA","rentcarla":"rabat-airport","yolcu":"rabat-airport",
-                  "aurum":"rabat-airport"},
-    "Fez":       {"iata":"FEZ","q":"Fez+Airport","dc":"/morocco/fez/fez",
-                  "qeeq":"ma-fez-fez","vipcars":"morocco/fez/fez-airport",
-                  "orbit":"fez-airport","wisecars":"fez/fez-airport",
-                  "carjet":"FEZ","enjoytravel":"FEZ","bsp":"fez-airport",
-                  "stressfree":"fez-airport","hotelbeds":"fez-airport",
-                  "rentcars":"fez-airport","carflexi":"FEZ",
-                  "priceline":"FEZ","rentcarla":"fez-airport","yolcu":"fez-airport",
-                  "aurum":"fez-airport"},
-    "Tangier":   {"iata":"TNG","q":"Tangier+Airport","dc":"/morocco/tangier/tng",
-                  "qeeq":"ma-tangier-tng","vipcars":"morocco/tangier/tangier-airport",
-                  "orbit":"tangier-airport","wisecars":"tangier/tangier-airport",
-                  "carjet":"TNG","enjoytravel":"TNG","bsp":"tangier-airport",
-                  "stressfree":"tangier-airport","hotelbeds":"tangier-airport",
-                  "rentcars":"tangier-airport","carflexi":"TNG",
-                  "priceline":"TNG","rentcarla":"tangier-airport","yolcu":"tangier-airport",
-                  "aurum":"tangier-airport"},
-    "Agadir":    {"iata":"AGA","q":"Agadir+Airport","dc":"/morocco/agadir/aga",
-                  "qeeq":"ma-agadir-aga","vipcars":"morocco/agadir/agadir-airport",
-                  "orbit":"agadir-airport","wisecars":"agadir/agadir-airport",
-                  "carjet":"AGA","enjoytravel":"AGA","bsp":"agadir-airport",
-                  "stressfree":"agadir-airport","hotelbeds":"agadir-airport",
-                  "rentcars":"agadir-airport","carflexi":"AGA",
-                  "priceline":"AGA","rentcarla":"agadir-airport","yolcu":"agadir-airport",
-                  "aurum":"agadir-airport"},
-    "Marrakesh": {"iata":"RAK","q":"Marrakech+Airport","dc":"/morocco/marrakech/rak",
-                  "qeeq":"ma-marrakech-rak","vipcars":"morocco/marrakech/marrakech-airport",
-                  "orbit":"marrakech-airport","wisecars":"marrakech/marrakech-airport",
-                  "carjet":"RAK","enjoytravel":"RAK","bsp":"marrakech-airport",
-                  "stressfree":"marrakech-airport","hotelbeds":"marrakech-airport",
-                  "rentcars":"marrakech-airport","carflexi":"RAK",
-                  "priceline":"RAK","rentcarla":"marrakech-airport","yolcu":"marrakech-airport",
-                  "aurum":"marrakech-airport"},
-    "Casablanca":{"iata":"CMN","q":"Casablanca+Airport","dc":"/morocco/casablanca/cmn",
-                  "qeeq":"ma-casablanca-cmn","vipcars":"morocco/casablanca/casablanca-airport",
-                  "orbit":"casablanca-airport","wisecars":"casablanca/casablanca-airport",
-                  "carjet":"CMN","enjoytravel":"CMN","bsp":"casablanca-airport",
-                  "stressfree":"casablanca-airport","hotelbeds":"casablanca-airport",
-                  "rentcars":"casablanca-airport","carflexi":"CMN",
-                  "priceline":"CMN","rentcarla":"casablanca-airport","yolcu":"casablanca-airport",
-                  "aurum":"casablanca-airport"},
-    "Podgorica": {"iata":"TGD","q":"Podgorica+Airport","dc":"/montenegro/podgorica/tgd",
-                  "qeeq":"me-podgorica-tgd","vipcars":"montenegro/podgorica/podgorica-airport",
-                  "orbit":"podgorica-airport","wisecars":"podgorica/podgorica-airport",
-                  "carjet":"TGD","enjoytravel":"TGD","bsp":"podgorica-airport",
-                  "stressfree":"podgorica-airport","hotelbeds":"podgorica-airport",
-                  "rentcars":"podgorica-airport","carflexi":"TGD",
-                  "priceline":"TGD","rentcarla":"podgorica-airport","yolcu":"podgorica-airport",
-                  "aurum":"podgorica-airport"},
-    "Timisoara": {"iata":"TSR","q":"Timisoara+Airport","dc":"/romania/timisoara/tsr",
-                  "qeeq":"ro-timisoara-tsr","vipcars":"romania/timisoara/timisoara-airport",
-                  "orbit":"timisoara-airport","wisecars":"timisoara/timisoara-airport",
-                  "carjet":"TSR","enjoytravel":"TSR","bsp":"timisoara-airport",
-                  "stressfree":"timisoara-airport","hotelbeds":"timisoara-airport",
-                  "rentcars":"timisoara-airport","carflexi":"TSR",
-                  "priceline":"TSR","rentcarla":"timisoara-airport","yolcu":"timisoara-airport",
-                  "aurum":"timisoara-airport"},
-    "Plaisance": {"iata":"MRU","q":"Mauritius+Airport","dc":"/mauritius/mahebourg/mru",
-                  "qeeq":"mu-mauritius-mru","vipcars":"mauritius/plaisance/mauritius-airport",
-                  "orbit":"mauritius-airport","wisecars":"mauritius/mauritius-airport",
-                  "carjet":"MRU","enjoytravel":"MRU","bsp":"mauritius-airport",
-                  "stressfree":"mauritius-airport","hotelbeds":"mauritius-airport",
-                  "rentcars":"mauritius-airport","carflexi":"MRU",
-                  "priceline":"MRU","rentcarla":"mauritius-airport","yolcu":"mauritius-airport",
-                  "aurum":"mauritius-airport"},
-    "Tivat":     {"iata":"TIV","q":"Tivat+Airport","dc":"/montenegro/tivat/tiv",
-                  "qeeq":"me-tivat-tiv","vipcars":"montenegro/tivat/tivat-airport",
-                  "orbit":"tivat-airport","wisecars":"tivat/tivat-airport",
-                  "carjet":"TIV","enjoytravel":"TIV","bsp":"tivat-airport",
-                  "stressfree":"tivat-airport","hotelbeds":"tivat-airport",
-                  "rentcars":"tivat-airport","carflexi":"TIV",
-                  "priceline":"TIV","rentcarla":"tivat-airport","yolcu":"tivat-airport",
-                  "aurum":"tivat-airport"},
-}
-
-DC_LOC = {
-    "Athens":"1753","Zante":"57438","Chania":"5784","Heraklion":"5844",
-    "Valletta":"2194","Tirana":"1802","Tunis":"1850","Enfidha":"57580",
-    "Monastir":"57582","Djerba":"57584","Orlando":"4766","Miami":"4642",
-    "Tampa":"4982","Hollywood":"4478","Rabat":"57588","Fez":"57590",
-    "Tangier":"57592","Agadir":"2554","Marrakesh":"2680","Casablanca":"2220",
-    "Podgorica":"57594","Timisoara":"57596","Plaisance":"57598","Tivat":"57600",
-}
-
-BN = {"otoQ":["otoq","oto q","oto-q"],"Drive365":["drive365","drive 365","drive-365"]}
-
-# ═══════════════════════════════════════════════════════════════════════
-# DIAGNOSTICS  (thread-safe)
-# ═══════════════════════════════════════════════════════════════════════
+# ─── DIAGNOSTICS ─────────────────────────────────────────────────────
 @dataclass
 class D:
     broker:str; city:str; brand:str; stage:str; detail:str
-    ts:str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    url:str=""; status:int=0; content_len:int=0
+    body_head:str=""; waf:bool=False
+    ts:str=field(default_factory=lambda:datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 DL: list = []
-_DL_LOCK = threading.Lock()
 
-def dl_append(entry):
-    with _DL_LOCK:
-        DL.append(entry)
+def dl(broker,city,brand,stage,detail,url="",status=0,content_len=0,body_head="",waf=False):
+    DL.append(D(broker=broker,city=city,brand=brand,stage=stage,detail=detail,
+                url=url,status=status,content_len=content_len,
+                body_head=body_head,waf=waf))
 
-# ═══════════════════════════════════════════════════════════════════════
-# PLAYWRIGHT — single browser, thread-local contexts
-# ═══════════════════════════════════════════════════════════════════════
-_PW_INST   = None
-_PW_BROW   = None
-_PW_LOCK   = threading.Lock()
-_tl        = threading.local()   # thread-local context storage
-
+# ─── PLAYWRIGHT HELPERS ──────────────────────────────────────────────
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 _STEALTH = """
 Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
 Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
@@ -299,446 +182,515 @@ Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
 window.chrome={runtime:{}};
 """
 
-_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-       "AppleWebKit/537.36 (KHTML, like Gecko) "
-       "Chrome/125.0.0.0 Safari/537.36")
+async def new_page(ctx):
+    p = await ctx.new_page()
+    await p.add_init_script(_STEALTH)
+    return p
 
-def _pw_browser():
-    global _PW_INST, _PW_BROW
-    if not HAS_PW:
-        return None
-    if _PW_BROW is None:
-        with _PW_LOCK:
-            if _PW_BROW is None:
-                print("[PW] Launching Chromium…")
-                _PW_INST = sync_playwright().start()
-                _PW_BROW = _PW_INST.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox","--disable-blink-features=AutomationControlled",
-                          "--disable-dev-shm-usage","--disable-gpu","--disable-extensions"])
-    return _PW_BROW
-
-def _pw_page():
-    """Return a fresh page on a thread-local browser context."""
-    browser = _pw_browser()
-    if not browser:
-        return None, None
-    # Create context once per thread; reuse it
-    if not getattr(_tl, 'ctx', None):
-        _tl.ctx = browser.new_context(
-            user_agent=_UA,
-            viewport={"width":1366,"height":768},
-            locale="en-US",
-            timezone_id="Europe/Athens",
-        )
-    page = _tl.ctx.new_page()
-    page.add_init_script(_STEALTH)
-    return page, _tl.ctx
-
-def pw_scan(url, needles, wait_ms=2000):
-    """Playwright scan: True/False/None. Short timeout to avoid hanging."""
+async def pw_get(page, url, wait_ms=3000, broker="", city="", brand=""):
+    """Navigate + wait. Returns (html, waf_bool) or (None, False) on error."""
     try:
-        page, _ = _pw_page()
-        if page is None:
-            return None
+        r = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(wait_ms)
-            txt = page.evaluate("document.body.innerText").lower()
-            for n in needles:
-                if n.lower() in txt:
-                    return True
-            return False
-        finally:
-            try: page.close()
-            except: pass
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(wait_ms)
+        html   = await page.content()
+        waf    = is_waf(html)
+        status = r.status if r else 0
+        if waf:
+            dl(broker,city,brand,"waf","WAF/bot challenge",url=url,status=status,
+               content_len=len(html),body_head=html[:200],waf=True)
+        return html, waf
     except Exception as e:
-        return None
+        dl(broker,city,brand,"err",str(e)[:200],url=url)
+        return None, False
 
-def pw_exists(url):
-    """Playwright existence check: True=exists, False=404, None=error."""
-    try:
-        page, _ = _pw_page()
-        if page is None:
-            return None
-        try:
-            resp = page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            page.wait_for_timeout(1000)
-            if resp and resp.status == 404:
-                return False
-            txt = page.evaluate("document.body.innerText").lower()
-            if len(txt) < 500 and ("404" in txt or "not found" in txt):
-                return False
-            return True
-        finally:
-            try: page.close()
-            except: pass
-    except Exception:
-        return None
+def result(html, brand, broker, city, url, status=0):
+    if html is None or is_waf(html): return "N/A"
+    found = brand_found(html, brand)
+    dl(broker,city,brand,"ok","✔" if found else "✖",
+       url=url,status=status,content_len=len(html),body_head=html[:200])
+    return "✔" if found else "✖"
 
-def pw_close():
-    global _PW_INST, _PW_BROW
-    try:
-        if _PW_BROW: _PW_BROW.close()
-    except: pass
-    try:
-        if _PW_INST: _PW_INST.stop()
-    except: pass
+# ─── BROKER AGENTS ───────────────────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════════
-# HTTP HELPERS  (with PW fallback)
-# ═══════════════════════════════════════════════════════════════════════
-H = {
-    "User-Agent": _UA,
-    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
+async def ck_discovercars(page, city, brand):
+    ci  = cids(city)
+    loc = ci.get("discovercars")
+    if not loc:
+        dl("Discovercars.com",city,brand,"no_id",f"No discovercars ID for {city}")
+        return "N/A"
+    sq = base64.b64encode(json.dumps({
+        "PickupLocationId":loc,"DropOffLocationId":loc,
+        "PickupDateTime":f"{PU}T{PUT}:00","DropOffDateTime":f"{DO}T{DOT}:00",
+        "ResidenceCountry":"GR","DriverAge":AGE,"Hash":""
+    }).encode()).decode()
+    url = f"https://www.discovercars.com/search?sq={sq}"
+    html,_ = await pw_get(page,url,4000,"Discovercars.com",city,brand)
+    return result(html,brand,"Discovercars.com",city,url)
+
+
+async def ck_qeeq(page, city, brand):
+    """Form-flow only (session hash)."""
+    iata = cids(city).get("iata","")
+    try:
+        await page.goto("https://www.qeeq.com/car/car-rental", wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(2000)
+        inp = await page.query_selector("input[id*='pickup'],input[name*='pickup'],input[placeholder*='ick-up']")
+        if inp:
+            await inp.fill(iata)
+            await page.wait_for_timeout(1500)
+            sug = await page.query_selector("[class*='suggest'] li,[class*='option'],[role='option']")
+            if sug: await sug.click()
+        btn = await page.query_selector("button[type='submit'],button[class*='search']")
+        if btn: await btn.click()
+        await page.wait_for_load_state("networkidle", timeout=15000)
+        await page.wait_for_timeout(3000)
+        return result(await page.content(),brand,"Qeeq.com",city,page.url)
+    except Exception as e:
+        dl("Qeeq.com",city,brand,"err",str(e)[:200]); return "N/A"
+
+
+async def ck_orbit(page, city, brand):
+    ci  = cids(city)
+    loc = ci.get("vipcars_loc")
+    if not loc:
+        dl("Orbitcarhire.com",city,brand,"no_id",f"No orbit loc for {city}"); return "N/A"
+    url = (f"https://www.orbitcarhire.com/en/reservation/vehicles/"
+           f"?pickupDateTime={PU}T{PUT}&dropoffDateTime={DO}T{DOT}"
+           f"&pickupLocation={loc}&dropoffLocation={loc}&residenceCountryIso=gr&currency=EUR")
+    html,_ = await pw_get(page,url,3000,"Orbitcarhire.com",city,brand)
+    return result(html,brand,"Orbitcarhire.com",city,url)
+
+
+async def ck_hotelbeds(page, city, brand):
+    ci    = cids(city)
+    piata = ci.get("hotelbeds_piata")
+    label = ci.get("hotelbeds_label","")
+    if not piata:
+        dl("carrental.hotelbeds.com",city,brand,"no_id",f"No hotelbeds PIATA for {city}"); return "N/A"
+    url = (f"https://carrental.hotelbeds.com/search.html?VEHICLEGROUP=passenger-vehicle"
+           f"&PLABEL={requests.utils.quote(label)}&PIATA={piata}"
+           f"&DLABEL={requests.utils.quote(label)}&DIATA={piata}"
+           f"&PDAY={PU_D.day}&PMONTHYEAR={PU_D.month}.{PU_D.year}&PDATE={PU}&PTIME={PUT}"
+           f"&DDAY={DO_D.day}&DMONTHYEAR={DO_D.month}.{DO_D.year}&DDATE={DO}&DTIME={DOT}"
+           f"&AGE={AGE}&CURRENCY=EUR")
+    html,_ = await pw_get(page,url,4000,"carrental.hotelbeds.com",city,brand)
+    return result(html,brand,"carrental.hotelbeds.com",city,url)
+
+
+async def _discover_via_form(page, home, iata, url_pattern, cache_keys, city):
+    """Generic form-nav + URL extraction helper."""
+    try:
+        await page.goto(home, wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(2000)
+        inp = await page.query_selector(
+            "input[name*='pickup'],input[id*='pickup'],input[name*='dep_destination'],"
+            "input[placeholder*='ick-up'],input[placeholder*='ick up']")
+        if not inp: return None
+        await inp.fill(iata)
+        await page.wait_for_timeout(2000)
+        sug = await page.query_selector(
+            "[class*='ui-menu-item'],[class*='suggestion'] li,[role='option'],"
+            "[class*='autocomplete'] li")
+        if not sug: return None
+        await sug.click()
+        await page.wait_for_timeout(500)
+        btn = await page.query_selector("button[type='submit'],input[type='submit']")
+        if btn: await btn.click()
+        await page.wait_for_load_state("networkidle", timeout=15000)
+        m = re.search(url_pattern, page.url)
+        if m:
+            vals = [int(g) if g.isdigit() else g for g in m.groups()]
+            for key, val in zip(cache_keys, vals):
+                cache_set(city, key, val)
+            return vals
+    except Exception as e:
+        print(f"  [discover {home}] {city}: {e}")
+    return None
+
+
+async def ck_enjoytravel(page, city, brand):
+    ci   = cids(city)
+    ploc = ci.get("enjoytravel")
+    if not ploc:
+        res = await _discover_via_form(page,
+            "https://www.enjoytravel.com/en/car-rental",
+            cids(city).get("iata",""),
+            r'plocation=(\d+)', ["enjoytravel"], city)
+        ploc = res[0] if res else None
+    if not ploc:
+        dl("Enjoytravel.com",city,brand,"no_id",f"No enjoytravel ID for {city}"); return "N/A"
+    url = (f"https://www.enjoytravel.com/en/booking/browse"
+           f"?plocation={ploc}&dlocation={ploc}"
+           f"&pdate={PU}&ddate={DO}&ptime={PUT}&dtime={DOT}&old=true")
+    html,_ = await pw_get(page,url,3000,"Enjoytravel.com",city,brand)
+    return result(html,brand,"Enjoytravel.com",city,url)
+
+
+async def ck_aurum(page, city, brand):
+    ci   = cids(city)
+    aid  = ci.get("aurum_id")
+    name = ci.get("aurum_name","")
+    iata = ci.get("iata","")
+    if not aid:
+        res = await _discover_via_form(page,
+            "https://www.aurumcars.de/en/",
+            iata, r'dep_destination_id=(\d+)', ["aurum_id"], city)
+        if res:
+            aid = res[0]
+            name = await page.evaluate(
+                "()=>{const e=document.querySelector('[name=dep_destination_name]');return e?e.value:''}")
+            if name: cache_set(city,"aurum_name",name)
+    if not aid:
+        dl("Aurumcars.de",city,brand,"no_id",f"No aurum ID for {city}"); return "N/A"
+    url = (f"https://www.aurumcars.de/search.php"
+           f"?dep_destination_name={requests.utils.quote(name or iata)}"
+           f"&dep_destination_id={aid}"
+           f"&dest_destination_name=&dest_destination_id="
+           f"&dep_date={PU_D.strftime('%d.%m.%Y')}&dep_time={PUT}"
+           f"&dest_date={DO_D.strftime('%d.%m.%Y')}&dest_time={DOT}"
+           f"&customer_age=27-73")
+    html,_ = await pw_get(page,url,3000,"Aurumcars.de",city,brand)
+    return result(html,brand,"Aurumcars.de",city,url)
+
+
+async def ck_carjet(page, city, brand):
+    iata = cids(city).get("iata","")
+    url  = f"https://www.carjet.com/en/car-hire/{iata.lower()}"
+    html,_ = await pw_get(page,url,5000,"Carjet.com",city,brand)
+    return result(html,brand,"Carjet.com",city,url)
+
+
+async def ck_rentcars(page, city, brand):
+    ci   = cids(city)
+    loc  = ci.get("rentcars")
+    iata = ci.get("iata","")
+    if not loc:
+        res = await _discover_via_form(page,
+            "https://www.rentcars.com/en/",
+            iata, r'/list/(\d+)-', ["rentcars"], city)
+        loc = res[0] if res else None
+    if not loc:
+        dl("Rentcars.com",city,brand,"no_id",f"No rentcars ID for {city}"); return "N/A"
+    pu_ts = int(PU_D.replace(hour=10,minute=0,second=0,microsecond=0).timestamp())
+    do_ts = int(DO_D.replace(hour=10,minute=0,second=0,microsecond=0).timestamp())
+    url   = f"https://www.rentcars.com/en/booking/list/{loc}-{pu_ts}-{loc}-{do_ts}-0-0-0-0-0-0-0-0"
+    html,_ = await pw_get(page,url,4000,"Rentcars.com",city,brand)
+    return result(html,brand,"Rentcars.com",city,url)
+
+
+async def ck_carflexi(page, city, brand):
+    """Form-flow only."""
+    iata = cids(city).get("iata","")
+    try:
+        await page.goto("https://www.carflexi.com/en/", wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(2000)
+        inp = await page.query_selector(
+            "input[name*='pickup'],input[id*='pickup'],input[placeholder*='ick']")
+        if inp:
+            await inp.fill(iata)
+            await page.wait_for_timeout(1500)
+            sug = await page.query_selector("[class*='autocomplete'] li,[class*='suggestion'] li")
+            if sug: await sug.click()
+        for sel,val in [("input[name*='from']",PU),("input[name*='to']",DO)]:
+            el = await page.query_selector(sel)
+            if el: await el.fill(val)
+        btn = await page.query_selector("button[type='submit']")
+        if btn: await btn.click()
+        await page.wait_for_load_state("networkidle", timeout=15000)
+        await page.wait_for_timeout(3000)
+        return result(await page.content(),brand,"CarFlexi.com",city,page.url)
+    except Exception as e:
+        dl("CarFlexi.com",city,brand,"err",str(e)[:200]); return "N/A"
+
+
+async def ck_ebookings(page, city, brand):
+    ci   = cids(city)
+    plc  = ci.get("ebookings_plc")
+    cr   = ci.get("ebookings_cr")
+    iata = ci.get("iata","")
+    if not plc or not cr:
+        res = await _discover_via_form(page,
+            "https://www.economybookings.com/en/",
+            iata, r'plc=(\d+).*?cr=(\d+)', ["ebookings_plc","ebookings_cr"], city)
+        if res: plc, cr = res[0], res[1]
+    if not plc or not cr:
+        dl("Economybookings.com",city,brand,"no_id",f"No ebookings IDs for {city}"); return "N/A"
+    url = (f"https://www.economybookings.com/en/cars/results"
+           f"?cr={cr}&crcy=EUR&lang=en&age={AGE}"
+           f"&py={PU_D.year}&pm={PU_D.month:02d}&pd={PU_D.day:02d}"
+           f"&dy={DO_D.year}&dm={DO_D.month:02d}&dd={DO_D.day:02d}"
+           f"&pt=1000&dt=1000&plc={plc}&dlc={plc}&reload=1")
+    html,_ = await pw_get(page,url,4000,"Economybookings.com",city,brand)
+    return result(html,brand,"Economybookings.com",city,url)
+
+
+async def ck_priceline(page, city, brand):
+    iata = cids(city).get("iata","")
+    url  = (f"https://www.priceline.com/rentalcars/listings/{iata}/{iata}"
+            f"/{PU}-{PUT.replace(':','%3A')}/{DO}-{DOT.replace(':','%3A')}/list")
+    html,_ = await pw_get(page,url,5000,"Priceline.com",city,brand)
+    return result(html,brand,"Priceline.com",city,url)
+
+
+async def ck_rentcarla(page, city, brand):
+    ci   = cids(city)
+    loc  = ci.get("rentcarla")
+    iata = ci.get("iata","")
+    if not loc:
+        res = await _discover_via_form(page,
+            "https://rentcarla.com/",
+            iata, r'/rental-cars/(\d+)/', ["rentcarla"], city)
+        loc = res[0] if res else None
+    if not loc:
+        dl("Rentcarla.com",city,brand,"no_id",f"No rentcarla ID for {city}"); return "N/A"
+    pu_ts = int(PU_D.replace(hour=12,minute=0,second=0,microsecond=0).timestamp()*1000)
+    pu_s  = PU.replace("-","") + PUT.replace(":","") + "00"
+    do_s  = DO.replace("-","") + DOT.replace(":","") + "00"
+    url   = f"https://rentcarla.com/rental-cars/{loc}/{loc}/{pu_s}/{do_s}?st={pu_ts}"
+    html,_ = await pw_get(page,url,3000,"Rentcarla.com",city,brand)
+    return result(html,brand,"Rentcarla.com",city,url)
+
+
+async def ck_vipcars(page, city, brand):
+    ci      = cids(city)
+    country = ci.get("vipcars_country")
+    vcity   = ci.get("vipcars_city")
+    loc     = ci.get("vipcars_loc")
+    iata    = ci.get("iata","")
+    if not all([country, vcity, loc]):
+        res = await _discover_via_form(page,
+            "https://www.vipcars.com/",
+            iata,
+            r'pickup_country=(\d+).*?pickup_city=(\d+).*?pickup_location=(\d+)',
+            ["vipcars_country","vipcars_city","vipcars_loc"], city)
+        if res: country, vcity, loc = res
+    if not all([country, vcity, loc]):
+        dl("Vipcars.com",city,brand,"no_id",f"No vipcars IDs for {city}"); return "N/A"
+    url = (f"https://www.vipcars.com/search/"
+           f"?aff=vipcars_web&language=en&googlemap=1"
+           f"&pickup_country={country}&pickup_city={vcity}&pickup_location={loc}"
+           f"&dropoff_country={country}&dropoff_city={vcity}&dropoff_location={loc}"
+           f"&pickup_date={PU}&pickup_time={PUT}"
+           f"&dropoff_date={DO}&dropoff_time={DOT}"
+           f"&rc=gr&currency=EUR&drv_age_chk=1&driver_age={AGE}&page=search")
+    html,_ = await pw_get(page,url,4000,"Vipcars.com",city,brand)
+    return result(html,brand,"Vipcars.com",city,url)
+
+
+async def ck_yolcu(page, city, brand):
+    ci  = cids(city)
+    pid = ci.get("yolcu_pid")
+    pp  = ci.get("yolcu_pp")
+    iata = ci.get("iata","")
+    if not pid or not pp:
+        res = await _discover_via_form(page,
+            "https://yolcu360.com/",
+            iata+" airport",
+            r'pid=([^&]+).*?p_p=([^&]+)',
+            ["yolcu_pid","yolcu_pp"], city)
+        if res: pid, pp = res
+    if not pid or not pp:
+        dl("Yolcu360",city,brand,"no_id",f"No yolcu IDs for {city}"); return "N/A"
+    url = (f"https://yolcu360.com/arac-kiralama/search"
+           f"?a=30-65&p_d={PU}&d_d={DO}&p_t={PUT}&d_t={DOT}"
+           f"&sb=recommended&p_p={pp}&pid={pid}")
+    html,_ = await pw_get(page,url,4000,"Yolcu360",city,brand)
+    return result(html,brand,"Yolcu360",city,url)
+
+
+async def ck_wisecars(page, city, brand):
+    ci  = cids(city)
+    loc = ci.get("vipcars_loc")   # same ID as VipCars
+    if not loc:
+        dl("Wisecars.com",city,brand,"no_id",f"No wisecars loc for {city}"); return "N/A"
+    url = (f"https://www.wisecars.com/en-us/results"
+           f"?pick_loc_id={loc}&pick_date={PU}&pick_time={PUT}"
+           f"&drop_loc_id={loc}&drop_date={DO}&drop_time={DOT}"
+           f"&age={AGE}&rc=US&source=wisecars_web")
+    html,_ = await pw_get(page,url,3000,"Wisecars.com",city,brand)
+    return result(html,brand,"Wisecars.com",city,url)
+
+
+async def ck_bsp(page, city, brand):
+    """Form-flow only."""
+    iata = cids(city).get("iata","")
+    try:
+        await page.goto("https://www.bsp-auto.com/en/", wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(2000)
+        inp = await page.query_selector(
+            "input[name*='pick'],input[id*='pick'],input[placeholder*='ick']")
+        if inp:
+            await inp.fill(iata)
+            await page.wait_for_timeout(1500)
+            sug = await page.query_selector("[class*='suggestion'] li,[role='option']")
+            if sug: await sug.click()
+        for sel,val in [("input[name*='from']",PU),("input[name*='to']",DO)]:
+            el = await page.query_selector(sel)
+            if el: await el.fill(val)
+        btn = await page.query_selector("button[type='submit'],input[type='submit']")
+        if btn: await btn.click()
+        await page.wait_for_load_state("networkidle", timeout=15000)
+        await page.wait_for_timeout(3000)
+        return result(await page.content(),brand,"BSP-auto.com",city,page.url)
+    except Exception as e:
+        dl("BSP-auto.com",city,brand,"err",str(e)[:200]); return "N/A"
+
+
+async def ck_stressfree(page, city, brand):
+    """StressFree accepts IATA directly."""
+    iata = cids(city).get("iata","")
+    url  = (f"https://www.stressfreecarrental.com/en/search-results"
+            f"?pickupLocationCode={iata}&dropoffLocationCode={iata}"
+            f"&pickupDate={PU_D.strftime('%d%%2F%m%%2F%Y')}"
+            f"&dropoffDate={DO_D.strftime('%d%%2F%m%%2F%Y')}"
+            f"&pickupHourMinute={PUT}&dropoffHourMinute={DOT}"
+            f"&driverStandardAge=on&driverAge={AGE}&language=en&searchType=Airport")
+    html,_ = await pw_get(page,url,5000,"StressFreeCarRental.com",city,brand)
+    return result(html,brand,"StressFreeCarRental.com",city,url)
+
+
+async def ck_otoq(page, city, brand):
+    iata = cids(city).get("iata","")
+    url  = (f"https://www.otoq.rent/en/reservation/vehicles/"
+            f"?poslovnica_od={iata}AP%7C"
+            f"&date_from={PU_D.strftime('%d%%2F%m%%2F%Y')}&time_from={PUT}"
+            f"&date_to={DO_D.strftime('%d%%2F%m%%2F%Y')}&time_to={DOT}#vehicles-list")
+    html,_ = await pw_get(page,url,3000,"otoQ.rent",city,brand)
+    return result(html,brand,"otoQ.rent",city,url)
+
+
+async def ck_drive365(page, city, brand):
+    iata = cids(city).get("iata","")
+    url  = (f"https://www.drive365.rent/en/reservation/vehicles/"
+            f"?office_from={iata}AP%7C"
+            f"&date_from={PU_D.strftime('%d%%2F%m%%2F%Y')}&time_from={PUT}"
+            f"&date_to={DO_D.strftime('%d%%2F%m%%2F%Y')}&time_to={DOT}#vehicles-list")
+    html,_ = await pw_get(page,url,3000,"Drive365.rent",city,brand)
+    return result(html,brand,"Drive365.rent",city,url)
+
+
+BROKER_FN = {
+    "Discovercars.com":        ck_discovercars,
+    "Qeeq.com":                ck_qeeq,
+    "Orbitcarhire.com":        ck_orbit,
+    "carrental.hotelbeds.com": ck_hotelbeds,
+    "Enjoytravel.com":         ck_enjoytravel,
+    "Aurumcars.de":            ck_aurum,
+    "Carjet.com":              ck_carjet,
+    "Rentcars.com":            ck_rentcars,
+    "CarFlexi.com":            ck_carflexi,
+    "Economybookings.com":     ck_ebookings,
+    "Priceline.com":           ck_priceline,
+    "Rentcarla.com":           ck_rentcarla,
+    "Vipcars.com":             ck_vipcars,
+    "Yolcu360":                ck_yolcu,
+    "Wisecars.com":            ck_wisecars,
+    "BSP-auto.com":            ck_bsp,
+    "StressFreeCarRental.com": ck_stressfree,
+    "otoQ.rent":               ck_otoq,
+    "Drive365.rent":           ck_drive365,
 }
 
-def hx(url, t=15):
-    try:
-        r = requests.get(url, headers=H, timeout=t, allow_redirects=True)
-        if r.status_code == 200: return True
-        if r.status_code in (404, 410): return False
-    except: pass
-    return pw_exists(url)
-
-def hc(url, needles, t=15):
-    try:
-        r = requests.get(url, headers=H, timeout=t, allow_redirects=True)
-        if r.status_code == 200:
-            txt = r.text.lower()
-            for n in needles:
-                if n.lower() in txt: return True
-            return False
-    except: pass
-    return pw_scan(url, needles)
-
-def bn(brand):
-    return BN.get(brand, []) + [brand.lower()]
-
-# ═══════════════════════════════════════════════════════════════════════
-# BROKER AGENTS
-# ═══════════════════════════════════════════════════════════════════════
-class Ag:
-    N = "Base"
-    def ck(self, city, brand): return "N/A"
-
-class DiscoverCars(Ag):
-    N = "Discovercars.com"
-    def ck(self, city, brand):
-        lc = DC_LOC.get(city)
-        if not lc: dl_append(D(self.N,city,brand,"url","No DC loc")); return "N/A"
-        slug = "otoq" if brand == "otoQ" else "drive365"
-        r = hx(f"https://www.discovercars.com/partners/{slug}-{lc}")
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dc = AP.get(city, {}).get("dc", "")
-        if dc:
-            r2 = hc(f"https://www.discovercars.com{dc}", bn(brand))
-            if r2 is True: return "✔"
-            if r2 is False: return "✖"
-        dl_append(D(self.N,city,brand,"http","Ambiguous")); return "N/A"
-
-class Qeeq(Ag):
-    N = "Qeeq.com"
-    def ck(self, city, brand):
-        slug = AP.get(city, {}).get("qeeq")
-        if not slug: dl_append(D(self.N,city,brand,"url","No slug")); return "N/A"
-        url = f"https://www.qeeq.com/car/car-rental-pro/airport/{slug}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class OrbitCarHire(Ag):
-    N = "Orbitcarhire.com"
-    def ck(self, city, brand):
-        slug = AP.get(city, {}).get("orbit")
-        if not slug: dl_append(D(self.N,city,brand,"url","No slug")); return "N/A"
-        url = f"https://www.orbitcarhire.com/{slug}?puDate={PU}&doDate={DO}&puTime={PUT}&doTime={DOT}&driverAge={AGE}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class Hotelbeds(Ag):
-    N = "carrental.hotelbeds.com"
-    def ck(self, city, brand):
-        q = AP.get(city, {}).get("q", "")
-        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
-        url = f"https://carrental.hotelbeds.com/search?location={q}&pickupDate={PU}&dropoffDate={DO}&pickupTime={PUT}&dropoffTime={DOT}&driverAge={AGE}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class EnjoyTravel(Ag):
-    N = "Enjoytravel.com"
-    def ck(self, city, brand):
-        iata = AP.get(city, {}).get("enjoytravel")
-        if not iata: dl_append(D(self.N,city,brand,"url","No IATA")); return "N/A"
-        url = f"https://www.enjoytravel.com/en/car-rental/search?pickUp={iata}&dropOff={iata}&dateFrom={PU}&dateTo={DO}&timeFrom={PUT}&timeTo={DOT}&age={AGE}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class AurumCars(Ag):
-    N = "Aurumcars.de"
-    def ck(self, city, brand):
-        q = AP.get(city, {}).get("q", "")
-        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
-        url = f"https://www.aurumcars.de/en/search?location={q}&from={PU}&to={DO}&pickup_time={PUT}&dropoff_time={DOT}&driver_age={AGE}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class Carjet(Ag):
-    N = "Carjet.com"
-    def ck(self, city, brand):
-        iata = AP.get(city, {}).get("carjet")
-        if not iata: dl_append(D(self.N,city,brand,"url","No IATA")); return "N/A"
-        # JS hash routing — skip HTTP, go straight to PW with extra wait
-        url = f"https://www.carjet.com/en/car-hire/{iata.lower()}"
-        r = pw_scan(url, bn(brand), wait_ms=4000)
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class Rentcars(Ag):
-    N = "Rentcars.com/en"
-    def ck(self, city, brand):
-        slug = AP.get(city, {}).get("rentcars")
-        if not slug: dl_append(D(self.N,city,brand,"url","No slug")); return "N/A"
-        url = f"https://www.rentcars.com/en/search/{slug}?from={PU}&to={DO}&pickup={PUT}&dropoff={DOT}&age={AGE}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class CarFlexi(Ag):
-    N = "CarFlexi.com"
-    def ck(self, city, brand):
-        iata = AP.get(city, {}).get("carflexi")
-        if not iata: dl_append(D(self.N,city,brand,"url","No IATA")); return "N/A"
-        url = f"https://www.carflexi.com/search?pickup={iata}&dropoff={iata}&from={PU}&to={DO}&pickupTime={PUT}&dropoffTime={DOT}&age={AGE}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class EconomyBookings(Ag):
-    N = "Economybookings.com"
-    def ck(self, city, brand):
-        iata = AP.get(city, {}).get("iata")
-        if not iata: dl_append(D(self.N,city,brand,"url","No IATA")); return "N/A"
-        slug = "otoq" if brand == "otoQ" else "drive365"
-        r = hx(f"https://www.economybookings.com/en/suppliers/{slug}/{iata.lower()}")
-        if r is True: return "✔"
-        if r is False: return "✖"
-        cs = city.lower().replace(" ", "-")
-        r2 = hx(f"https://www.economybookings.com/en/suppliers/{slug}/{cs}")
-        if r2 is True: return "✔"
-        if r2 is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw","Ambiguous")); return "N/A"
-
-class Priceline(Ag):
-    N = "Priceline.com/rental-cars"
-    def ck(self, city, brand):
-        iata = AP.get(city, {}).get("priceline")
-        if not iata: dl_append(D(self.N,city,brand,"url","No IATA")); return "N/A"
-        url = f"https://www.priceline.com/rental-cars/{iata.lower()}"
-        r = pw_scan(url, bn(brand), wait_ms=5000)
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class RentCarla(Ag):
-    N = "Rentcarla.com"
-    def ck(self, city, brand):
-        q = AP.get(city, {}).get("q", "")
-        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
-        url = f"https://www.rentcarla.com/search?location={q}&from={PU}&to={DO}&pickupTime={PUT}&dropoffTime={DOT}&age={AGE}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class VipCars(Ag):
-    N = "Vipcars.com"
-    def ck(self, city, brand):
-        slug = AP.get(city, {}).get("vipcars")
-        if not slug: dl_append(D(self.N,city,brand,"url","No slug")); return "N/A"
-        url = f"https://www.vipcars.com/car-rental/{slug}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class Yolcu360(Ag):
-    N = "Yolcu360"
-    def ck(self, city, brand):
-        q = AP.get(city, {}).get("q", "")
-        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
-        url = f"https://www.yolcu360.com/en/car-rental?pickUp={q}&pickUpDate={PU}&dropOffDate={DO}&pickUpTime={PUT}&dropOffTime={DOT}&age={AGE}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class WiseCars(Ag):
-    N = "Wisecars.com"
-    def ck(self, city, brand):
-        slug = AP.get(city, {}).get("wisecars")
-        if not slug: dl_append(D(self.N,city,brand,"url","No slug")); return "N/A"
-        url = f"https://www.wisecars.com/en-us/car-rental/{slug}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class BSPAuto(Ag):
-    N = "BSP-auto.com"
-    def ck(self, city, brand):
-        q = AP.get(city, {}).get("q", "")
-        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
-        url = f"https://www.bsp-auto.com/en/search?location={q}&from={PU}&to={DO}&pickupTime={PUT}&dropoffTime={DOT}&age={AGE}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class StressFree(Ag):
-    N = "StressFreeCarRental.com"
-    def ck(self, city, brand):
-        q = AP.get(city, {}).get("q", "")
-        if not q: dl_append(D(self.N,city,brand,"url","No query")); return "N/A"
-        url = f"https://www.stressfreecarrental.com/search?location={q}&from={PU}&to={DO}&pickupTime={PUT}&dropoffTime={DOT}&driverAge={AGE}"
-        r = hc(url, bn(brand))
-        if r is True: return "✔"
-        if r is False: return "✖"
-        dl_append(D(self.N,city,brand,"pw",f"Failed: {url}")); return "N/A"
-
-class OtoqRent(Ag):
-    N = "otoQ.rent"
-    def ck(self, city, brand): return "✔" if brand == "otoQ" else "✖"
-
-class Drive365Rent(Ag):
-    N = "Drive365.rent"
-    def ck(self, city, brand): return "✔" if brand == "Drive365" else "✖"
-
-AG = {
-    "Discovercars.com":DiscoverCars, "Qeeq.com":Qeeq,
-    "Orbitcarhire.com":OrbitCarHire, "carrental.hotelbeds.com":Hotelbeds,
-    "Enjoytravel.com":EnjoyTravel, "Aurumcars.de":AurumCars, "Aurum":AurumCars,
-    "Carjet.com":Carjet, "Rentcars.com/en":Rentcars, "CarFlexi.com":CarFlexi,
-    "Economybookings.com":EconomyBookings, "EconomyBookings.com":EconomyBookings,
-    "Priceline.com/rental-cars":Priceline, "Rentcarla.com":RentCarla,
-    "Vipcars.com":VipCars, "Yolcu360":Yolcu360, "Wisecars.com":WiseCars,
-    "BSP-auto.com":BSPAuto, "bsp-auto.com":BSPAuto,
-    "StressFreeCarRental.com":StressFree,
-    "otoQ.rent":OtoqRent, "Drive365.rent":Drive365Rent,
-}
-
-BNM = {"EconomyBookings.com":"Economybookings.com","bsp-auto.com":"BSP-auto.com","Aurum":"Aurumcars.de"}
-
-# ═══════════════════════════════════════════════════════════════════════
-# ORCHESTRATOR  — parallel with ThreadPoolExecutor
-# ═══════════════════════════════════════════════════════════════════════
-def build_tasks():
-    t = {}
+# ─── ORCHESTRATOR ────────────────────────────────────────────────────
+def build_jobs():
+    jobs = []
+    seen = set()
     for br in OTOQ_BROKERS:
-        for _, cl in OTOQ_AREAS.items():
-            for ci in cl:
-                t.setdefault((br, ci), [])
-                if "otoQ" not in t[(br, ci)]: t[(br, ci)].append("otoQ")
+        for cities in OTOQ_AREAS.values():
+            for city in cities:
+                k = (br,city,"otoQ")
+                if k not in seen: jobs.append(k); seen.add(k)
     for br in DRIVE365_BROKERS:
-        for _, cl in DRIVE365_AREAS.items():
-            for ci in cl:
-                cn = BNM.get(br, br)
-                key = (cn, ci) if (cn, ci) in t else (br, ci)
-                t.setdefault(key, [])
-                if "Drive365" not in t[key]: t[key].append("Drive365")
-    return t
+        for cities in DRIVE365_AREAS.values():
+            for city in cities:
+                k = (br,city,"Drive365")
+                if k not in seen: jobs.append(k); seen.add(k)
+    return jobs
 
-def run():
-    tasks = build_tasks()
-    jobs = [(br, ci, b) for (br, ci), brands in tasks.items() for b in brands]
-    tot = len(jobs)
-    print(f"\n[RUN] {len(tasks)} combos, {tot} checks — 5 workers")
-
-    res = {}
-    res_lock = threading.Lock()
+async def run_all():
+    if not HAS_PW:
+        print("Playwright not available"); return {}
+    load_cache()
+    jobs = build_jobs()
+    print(f"\n[RUN] {len(jobs)} checks — 6 concurrent pages")
+    results: dict = {}
+    res_lock = asyncio.Lock()
+    sem = asyncio.Semaphore(6)
     done = [0]
 
-    def do_one(br, ci, b):
-        cls = AG.get(br)
-        if not cls:
-            dl_append(D(br, ci, b, "url", "No agent"))
-            return br, ci, b, "N/A"
-        try:
-            r = cls().ck(ci, b)
-        except Exception as e:
-            dl_append(D(br, ci, b, "err", str(e)[:200]))
-            r = "N/A"
-        with res_lock:
-            done[0] += 1
-            if done[0] % 20 == 0 or done[0] == tot:
-                print(f"  [{done[0]}/{tot}] {br} → {ci} ({b}) = {r}")
-        return br, ci, b, r
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox","--disable-blink-features=AutomationControlled",
+                  "--disable-dev-shm-usage","--disable-gpu","--disable-extensions"])
+        ctx = await browser.new_context(
+            user_agent=_UA, viewport={"width":1366,"height":768},
+            locale="en-US", timezone_id="Europe/Athens")
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = [ex.submit(do_one, br, ci, b) for br, ci, b in jobs]
-        for f in as_completed(futures):
-            br, ci, b, r = f.result()
-            with res_lock:
-                res.setdefault(br, {}).setdefault(ci, {})[b] = r
+        async def do_one(br, city, brand):
+            async with sem:
+                fn = BROKER_FN.get(br)
+                if not fn:
+                    dl(br,city,brand,"no_agent","No agent"); r = "N/A"
+                else:
+                    page = await new_page(ctx)
+                    try:
+                        r = await fn(page, city, brand)
+                    except Exception as e:
+                        dl(br,city,brand,"exc",str(e)[:200]); r = "N/A"
+                    finally:
+                        await page.close()
+                async with res_lock:
+                    done[0] += 1
+                    results.setdefault(br,{}).setdefault(city,{})[brand] = r
+                    if done[0] % 25 == 0 or done[0] == len(jobs):
+                        print(f"  [{done[0]}/{len(jobs)}] {br} / {city} ({brand}) = {r}")
 
-    return res
+        await asyncio.gather(*[do_one(br,ci,b) for br,ci,b in jobs])
+        await browser.close()
+    return results
 
 def extract(ar, brand, areas, brokers):
-    o = {}
+    out = {}
     for br in brokers:
-        o[br] = {}
-        bk = BNM.get(br, br)
-        for _, cl in areas.items():
-            for ci in cl:
-                v = "N/A"
-                for k in (bk, br):
-                    if k in ar and ci in ar[k]:
-                        v = ar[k][ci].get(brand, "N/A"); break
-                o[br][ci] = v
-    return o
+        out[br] = {}
+        for cities in areas.values():
+            for city in cities:
+                out[br][city] = ar.get(br,{}).get(city,{}).get(brand,"N/A")
+    return out
 
-# ═══════════════════════════════════════════════════════════════════════
-# GOOGLE SHEETS
-# ═══════════════════════════════════════════════════════════════════════
+# ─── GOOGLE SHEETS ───────────────────────────────────────────────────
 def gsc():
     cj = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
-    if not cj: print("WARN: no creds"); return None
+    if not cj: print("WARN: no GOOGLE_SHEETS_CREDENTIALS"); return None
     return gspread.authorize(Credentials.from_service_account_info(
         json.loads(cj),
         scopes=["https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive"]))
 
-def sd(label, areas, brokers, res):
-    cities = [(co, ci) for co, cl in areas.items() for ci in cl]
-    r1 = [label] + [""] * len(cities)
-    r2, p = [""], None
-    for co, _ in cities:
-        r2.append(co if co != p else ""); p = co
-    r3 = [""] + [ci for _, ci in cities]
-    rows = [[br] + [res.get(br, {}).get(ci, "N/A") for _, ci in cities] for br in brokers]
-    return [r1, r2, r3] + rows + [[], [f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')} | {PU}→{DO}"]]
+def sheet_data(label, areas, brokers, res):
+    cities = [(co,ci) for co,cl in areas.items() for ci in cl]
+    r1 = [label]+[""]*len(cities)
+    r2, prev = [""], None
+    for co,_ in cities:
+        r2.append(co if co!=prev else ""); prev=co
+    r3 = [""]+[ci for _,ci in cities]
+    rows = [[br]+[res.get(br,{}).get(ci,"N/A") for _,ci in cities] for br in brokers]
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+    return [r1,r2,r3]+rows+[[],[f"Updated: {ts} | {PU}→{DO}"]]
 
-def dd():
-    return [["Timestamp","Broker","City","Brand","Stage","Detail"]] + [
-        [e.ts, e.broker, e.city, e.brand, e.stage, e.detail[:500]] for e in DL]
+def diag_data():
+    hdr = ["Timestamp","Broker","City","Brand","Stage","Detail",
+           "URL","HTTP Status","Content Len","Body Head","WAF"]
+    return [hdr]+[[e.ts,e.broker,e.city,e.brand,e.stage,e.detail[:500],
+                   e.url,e.status,e.content_len,e.body_head[:200],str(e.waf)]
+                  for e in DL]
 
-def ug(oq, d3):
+def update_sheets(oq, d3):
     cl = gsc()
     if not cl: return
     sid = os.environ.get("SPREADSHEET_ID")
@@ -747,101 +699,81 @@ def ug(oq, d3):
         sh = cl.open_by_key(sid)
     except Exception as e:
         print(f"ERR open sheet: {e}"); return
-    for title, data in [("otoQ", sd("otoQ", OTOQ_AREAS, OTOQ_BROKERS, oq)),
-                        ("Drive365", sd("DRIVE365", DRIVE365_AREAS, DRIVE365_BROKERS, d3)),
-                        ("Diagnostics", dd())]:
+    for title, data in [
+        ("otoQ",      sheet_data("otoQ",    OTOQ_AREAS,    OTOQ_BROKERS,    oq)),
+        ("Drive365",  sheet_data("Drive365",DRIVE365_AREAS,DRIVE365_BROKERS, d3)),
+        ("Diagnostics", diag_data()),
+    ]:
         try:
             ws = sh.worksheet(title); ws.clear()
         except gspread.exceptions.WorksheetNotFound:
             ws = sh.add_worksheet(title=title,
-                                  rows=len(data)+5,
+                                  rows=len(data)+10,
                                   cols=max(len(r) for r in data)+5)
         ws.update(range_name="A1", values=data)
         print(f"  ✔ Sheet '{title}'")
 
-# ═══════════════════════════════════════════════════════════════════════
-# LOCAL EXCEL
-# ═══════════════════════════════════════════════════════════════════════
-def xb(ws, label, areas, brokers, res):
-    hw = Font(bold=True, size=11, name="Arial", color="FFFFFF")
-    cf = Font(italic=True, size=10, name="Arial")
-    df = Font(size=10, name="Arial")
-    bf = Font(bold=True, size=14, name="Arial")
-    ct = Alignment(horizontal="center", vertical="center")
-    la = Alignment(horizontal="left", vertical="center")
-    gf = PatternFill("solid", fgColor="C6EFCE")
-    rf = PatternFill("solid", fgColor="FFC7CE")
-    gr = PatternFill("solid", fgColor="D9D9D9")
-    hd = PatternFill("solid", fgColor="4472C4")
-    bd = Border(left=Side("thin"), right=Side("thin"), top=Side("thin"), bottom=Side("thin"))
-    cities, spans = [], []; col = 2
-    for co, cl in areas.items():
-        s = col
-        for ci in cl: cities.append((co, ci)); col += 1
-        spans.append((co, s, col-1))
-    ws.cell(1, 1, label).font = bf
-    for co, s, e in spans:
-        c = ws.cell(2, s, co); c.font = hw; c.fill = hd; c.alignment = ct; c.border = bd
-        if s != e: ws.merge_cells(start_row=2, start_column=s, end_row=2, end_column=e)
-        for x in range(s, e+1): ws.cell(2, x).border = bd; ws.cell(2, x).fill = hd
-    for i, (_, ci) in enumerate(cities):
-        c = ws.cell(3, i+2, ci); c.font = cf; c.alignment = ct; c.border = bd
-    for bi, br in enumerate(brokers):
-        r = 4+bi; c = ws.cell(r, 1, br); c.font = df; c.alignment = la; c.border = bd
-        for ci_i, (_, ci) in enumerate(cities):
-            v = res.get(br, {}).get(ci, "N/A")
-            c = ws.cell(r, ci_i+2, v); c.font = df; c.alignment = ct; c.border = bd
-            c.fill = gf if v == "✔" else rf if v == "✖" else gr
-    ws.column_dimensions["A"].width = 28
-    for x in range(2, col): ws.column_dimensions[get_column_letter(x)].width = 14
-
-def xd(ws):
-    hf = Font(bold=True, size=11, name="Arial")
-    df = Font(size=9, name="Arial")
-    bd = Border(left=Side("thin"), right=Side("thin"), top=Side("thin"), bottom=Side("thin"))
-    for ci, h in enumerate(["Timestamp","Broker","City","Brand","Stage","Detail"], 1):
-        c = ws.cell(1, ci, h); c.font = hf; c.border = bd
-    for ri, e in enumerate(DL, 2):
-        for ci, v in enumerate([e.ts, e.broker, e.city, e.brand, e.stage, e.detail[:500]], 1):
-            c = ws.cell(ri, ci, v); c.font = df; c.border = bd
-    ws.column_dimensions["A"].width = 20; ws.column_dimensions["B"].width = 28
-    ws.column_dimensions["C"].width = 14; ws.column_dimensions["D"].width = 12
-    ws.column_dimensions["E"].width = 14; ws.column_dimensions["F"].width = 80
-
-def wx(oq, d3, fn="Broker_Availability_Tracker.xlsx"):
-    wb = Workbook(); ws1 = wb.active; ws1.title = "otoQ"
-    xb(ws1, "otoQ", OTOQ_AREAS, OTOQ_BROKERS, oq)
-    ws2 = wb.create_sheet("Drive365"); xb(ws2, "DRIVE365", DRIVE365_AREAS, DRIVE365_BROKERS, d3)
-    ws3 = wb.create_sheet("Diagnostics"); xd(ws3)
+# ─── LOCAL EXCEL ─────────────────────────────────────────────────────
+def write_excel(oq, d3, fn):
+    wb = Workbook()
+    ws1 = wb.active; ws1.title="otoQ"
+    _fill_sheet(ws1,"otoQ",OTOQ_AREAS,OTOQ_BROKERS,oq)
+    ws2 = wb.create_sheet("Drive365")
+    _fill_sheet(ws2,"Drive365",DRIVE365_AREAS,DRIVE365_BROKERS,d3)
+    ws3 = wb.create_sheet("Diagnostics"); _fill_diag(ws3)
     wb.save(fn); print(f"  ✔ Excel: {fn}")
 
-# ═══════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════
+def _fill_sheet(ws, label, areas, brokers, res):
+    gf=PatternFill("solid",fgColor="C6EFCE"); rf=PatternFill("solid",fgColor="FFC7CE")
+    gr=PatternFill("solid",fgColor="D9D9D9"); hd=PatternFill("solid",fgColor="4472C4")
+    hw=Font(bold=True,size=11,name="Arial",color="FFFFFF"); df=Font(size=10,name="Arial")
+    ct=Alignment(horizontal="center",vertical="center")
+    bd=Border(left=Side("thin"),right=Side("thin"),top=Side("thin"),bottom=Side("thin"))
+    cities=[(co,ci) for co,cl in areas.items() for ci in cl]
+    ws.cell(1,1,label).font=Font(bold=True,size=14,name="Arial")
+    col=2
+    for co,cl in areas.items():
+        s=col
+        for ci in cl: ws.cell(3,col,ci).alignment=ct; col+=1
+        c=ws.cell(2,s,co); c.font=hw; c.fill=hd; c.alignment=ct
+        if col-s>1: ws.merge_cells(start_row=2,start_column=s,end_row=2,end_column=col-1)
+    for bi,br in enumerate(brokers):
+        r=4+bi; ws.cell(r,1,br).font=df
+        for ci_i,(_,ci) in enumerate(cities):
+            v=res.get(br,{}).get(ci,"N/A"); c=ws.cell(r,ci_i+2,v)
+            c.alignment=ct; c.font=df
+            c.fill=gf if v=="✔" else rf if v=="✖" else gr
+    ws.column_dimensions["A"].width=28
+    for x in range(2,col): ws.column_dimensions[get_column_letter(x)].width=14
+
+def _fill_diag(ws):
+    for ci,h in enumerate(["Timestamp","Broker","City","Brand","Stage",
+                            "Detail","URL","Status","Content Len","Body","WAF"],1):
+        ws.cell(1,ci,h).font=Font(bold=True)
+    for ri,e in enumerate(DL,2):
+        for ci,v in enumerate([e.ts,e.broker,e.city,e.brand,e.stage,e.detail[:500],
+                               e.url,e.status,e.content_len,e.body_head[:200],str(e.waf)],1):
+            ws.cell(ri,ci,v)
+
+# ─── MAIN ────────────────────────────────────────────────────────────
 def main():
-    fn = os.environ.get("OUTPUT_FILE", "Broker_Availability_Tracker.xlsx")
+    fn = os.environ.get("OUTPUT_FILE","Broker_Availability_Tracker.xlsx")
     print("="*60)
-    print("Broker Availability Tracker v2 — Parallel Edition")
+    print("Broker Availability Tracker v3 — Async Self-Discovering")
     print("="*60)
-
-    # Pre-warm Playwright in main thread before spawning workers
-    if HAS_PW:
-        _pw_browser()
-
-    ar = run()
-    oq = extract(ar, "otoQ", OTOQ_AREAS, OTOQ_BROKERS)
-    d3 = extract(ar, "Drive365", DRIVE365_AREAS, DRIVE365_BROKERS)
-
-    s = lambda r: tuple(sum(1 for b in r.values() for v in b.values() if v == x) for x in ("✔","✖","N/A"))
-    o1, o2, o3 = s(oq); d1, d2, d3_ = s(d3)
+    ar = asyncio.run(run_all())
+    oq = extract(ar,"otoQ",   OTOQ_AREAS,   OTOQ_BROKERS)
+    d3 = extract(ar,"Drive365",DRIVE365_AREAS,DRIVE365_BROKERS)
+    def counts(r):
+        v=[x for row in r.values() for x in row.values()]
+        return sum(x=="✔" for x in v),sum(x=="✖" for x in v),sum(x=="N/A" for x in v)
+    o1,o2,o3=counts(oq); d1,d2,d3_=counts(d3)
     print(f"\n  otoQ:     ✔{o1}  ✖{o2}  N/A {o3}")
     print(f"  Drive365: ✔{d1}  ✖{d2}  N/A {d3_}")
     print(f"  Diag entries: {len(DL)}")
-
-    print("\n--- Excel ---"); wx(oq, d3, fn)
-    print("--- Sheets ---"); ug(oq, d3)
-    pw_close()
+    print("\n--- Excel ---"); write_excel(oq,d3,fn)
+    print("--- Sheets ---"); update_sheets(oq,d3)
     print("\nDone!")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
