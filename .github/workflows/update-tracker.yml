@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests gspread google-auth openpyxl playwright
+          pip install requests gspread google-auth openpyxl playwright playwright-stealth
           playwright install chromium --with-deps
 
       - name: Run tracker
@@ -28,3 +28,11 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: python broker_tracker.py
+
+      - name: Commit discovered ID cache
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add city_ids_cache.json || true
+          git diff --cached --quiet || git commit -m "chore: update city_ids_cache"
+          git push || true
